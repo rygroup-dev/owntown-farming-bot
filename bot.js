@@ -36,10 +36,12 @@ const tg = new Telegram({
   logger: log,
   onChatIdLearned: (id) => persistEnv('TELEGRAM_CHAT_ID', id),
 });
-function notify(m) { tg.send(m); }
+function notify(m) { tg.send(m); }                                   // always (profit reports, command replies, critical)
+function notifySys(m) { if (!config.notifyProfitOnly) tg.send(m); }  // routine/system events — muted when profit-only
 
 // ============ AUTOPILOT STATE ============
 let paused = false;
+let stopped = false;          // true = game session fully off (user plays manually); no auto-reconnect
 let lastActivity = Date.now();        // updated on any meaningful game result
 let activeSocket = null;              // current live socket (for watchdog/commands)
 let lastCycleStart = Date.now();
@@ -977,6 +979,7 @@ function startAction(sock, type) {
 // ============ MAIN BOT ============
 let fundingNotified = false;
 async function startBot() {
+  if (stopped) { log('⏹️ startBot skipped — bot is stopped'); return; }
   // single-socket guard: cancel pending retry + tear down any old socket
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (activeSocket) { try { activeSocket.removeAllListeners(); activeSocket.disconnect(); } catch (e) {} activeSocket = null; }
@@ -1011,7 +1014,7 @@ async function startBot() {
     if(d.zone) zone = d.zone;
     if(d.gameBalance !== undefined) balance = d.gameBalance;
     if(d.level !== undefined) {
-      if(level && d.level > level) notify(`⬆️ <b>Level up!</b> Now level ${d.level}`);
+      if(level && d.level > level) notifySys(`⬆️ <b>Level up!</b> Now level ${d.level}`);
       level = d.level;
     }
     if(d.stamina !== undefined) stamina = d.stamina;
@@ -1094,7 +1097,7 @@ async function startBot() {
     if(d.phase === 'active' && !stats.worldBossActive) {
       stats.worldBossActive = true;
       log(`👹 WORLD BOSS ACTIVE! ${d.name || ''} HP:${d.hp}/${d.maxHp}`);
-      notify(`👹 <b>World Boss spawned!</b> ${d.name || ''} — auto-entering`);
+      notifySys(`👹 <b>World Boss spawned!</b> ${d.name || ''} — auto-entering`);
       socket.emit('worldboss:enter');
     }
     if(d.phase === 'dead') {
@@ -1286,7 +1289,7 @@ async function startBot() {
     touchActivity();
     if(retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     log('Connected!');
-    notify(`🟢 <b>Connected</b> — farming dimulai 🎮\n<i>${GAME_HOST}</i>`);
+    notifySys(`🟢 <b>Connected</b> — farming dimulai 🎮\n<i>${GAME_HOST}</i>`);
     activeSocket = socket;
     let started = false;
     socket.on('player:correction', function onCorr(d) {
@@ -1313,7 +1316,8 @@ async function startBot() {
   socket.on('disconnect', () => {
     log('Disconnected!');
     connected = false;
-    notify(`🔴 <b>Disconnected</b> — auto-reconnect in 30s`);
+    if (stopped) { log('⏹️ stopped — not reconnecting'); return; }
+    notifySys(`🔴 <b>Disconnected</b> — auto-reconnect in 30s`);
     scheduleStart(30000);
   });
 
@@ -1406,12 +1410,12 @@ setInterval(() => {
 // Detects "stuck" states the in-socket recovery misses and self-heals.
 const WATCHDOG_STUCK_MS = Math.max(2, config.watchdogStuckMin) * 60000;
 setInterval(() => {
-  if (paused) return;
+  if (paused || stopped) return;
   const idle = Date.now() - lastActivity;
   // 1) Connected but no game activity for too long -> kick the cycle / reconnect
   if (connected && idle > WATCHDOG_STUCK_MS) {
     log(`🐶 WATCHDOG: no activity for ${Math.round(idle/60000)}m — recovering`);
-    notify(`🐶 <b>Watchdog</b>: stuck ${Math.round(idle/60000)}m, restarting cycle`);
+    notifySys(`🐶 <b>Watchdog</b>: stuck ${Math.round(idle/60000)}m, restarting cycle`);
     touchActivity(); // reset so we don't loop instantly
     if (activeSocket && activeSocket.connected) {
       try { runNextCycle(activeSocket); } catch (e) { log('🐶 cycle restart failed: ' + e.message); }
@@ -1430,22 +1434,33 @@ setInterval(() => {
 // ============ TELEGRAM COMMANDS ============
 tg.on('help', () => notify([
   '<b>Owntown Bot — commands</b>',
-  '/start — connect + start farming now',
-  '/status — live stats summary',
-  '/balance — balance + bank',
-  '/log [n] — last n log lines (default 15)',
-  '/pause — pause farming (stays connected)',
-  '/resume — resume farming',
-  '/restart — restart the process (systemd relaunches)',
-  '/update — pull latest code from git + restart',
-  '/reauth — force re-authentication',
-  '/help — this message',
+  '/start — bot ON (connect + farming)',
+  '/stop — bot OFF (lepas sesi, buat main manual)',
+  '/status — ringkasan stats live',
+  '/dashboard — link panel web',
+  '/balance — saldo + bank',
+  '/log [n] — log terakhir (default 15)',
+  '/pause — jeda farming (tetap connect)',
+  '/resume — lanjut farming',
+  '/restart — restart proses',
+  '/update — pull update code + restart',
+  '/reauth — login ulang ke game',
+  '',
+  '<i>⚠️ 1 wallet = 1 sesi. Mau main manual? /stop dulu.</i>',
 ].join('\n')));
 tg.on('start', () => {
-  paused = false;
+  paused = false; stopped = false;
   if (connected) { notify('▶️ Already farming. /status for stats.'); return; }
-  notify('🚀 Connecting + starting farming now...');
+  notify('🚀 Bot ON — connecting + farming…\n<i>Pastikan kamu LOGOUT dari Owntown manual (1 wallet = 1 sesi).</i>');
   startBot();
+});
+tg.on('stop', () => {
+  stopped = true; paused = false;
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  try { if (activeSocket) activeSocket.disconnect(); } catch {}
+  connected = false;
+  notify('⏹️ <b>Bot OFF</b> — sesi game dilepas.\nSekarang kamu bebas main manual pakai wallet ini. Ketik /start kalau mau bot lanjut lagi.');
+  log('⏹️ Stopped via Telegram (manual play mode)');
 });
 let publicIp = '';
 function getPublicIp() {
@@ -1501,5 +1516,5 @@ process.on('unhandledRejection', (reason) => {
 // ============ BOOT ============
 log('🚀 Starting v23 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram + Autopilot...');
 tg.startPolling();
-notify('🚀 <b>Owntown Bot</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /dashboard untuk panel live</i>');
+notifySys('🚀 <b>Owntown Bot</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /dashboard untuk panel live</i>');
 startBot();

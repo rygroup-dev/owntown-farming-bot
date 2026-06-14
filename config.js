@@ -58,6 +58,7 @@ const config = {
   // Behaviour
   gameHost: process.env.GAME_HOST || 'owntown.fun',
   reportIntervalMin: parseInt(process.env.REPORT_INTERVAL_MIN || '30', 10),
+  notifyProfitOnly: (process.env.NOTIFY_PROFIT_ONLY || 'true').toLowerCase() === 'true',
   watchdogStuckMin: parseInt(process.env.WATCHDOG_STUCK_MIN || '5', 10),
   logPath: process.env.LOG_PATH || '/tmp/owntown_v23.log',
   tokenPath: process.env.TOKEN_PATH || '/tmp/owntown_token.txt',
