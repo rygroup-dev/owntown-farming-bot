@@ -7,7 +7,7 @@ const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
 const { startDashboard } = require('./dashboard');
 const crypto = require('crypto');
-const { ErrorBus, signature } = require('./errorbus');
+const { ErrorBus } = require('./errorbus');
 const selfheal = require('./selfheal');
 const path = require('path');
 const errorBus = new ErrorBus(path.join(__dirname, 'errors.json'));
@@ -1074,7 +1074,8 @@ function runNextCycle(sock) {
       log(`⚠️ WRONG ZONE: expected ${expected}, got ${zone}`);
       stats.wrongZone++;
       reportError({ code: 'WRONG_ZONE', expected, zone, context: `expected ${expected}, got ${zone}` });
-      if (ZONE_BLACKLIST.includes(expected)) { log(`⛔ ${expected} blacklisted — skip cycle`); setTimeout(() => runNextCycle(sock), 2000); return; }
+      // Landed in a known-bad respawn zone repeatedly → skip this cycle to let position settle instead of walk-retrying.
+      if (ZONE_BLACKLIST.includes(zone)) { log(`⛔ landed in blacklisted ${zone} — skip cycle`); setTimeout(() => runNextCycle(sock), 2000); return; }
       const target = ZONE_TARGETS[expected];
       if(target) {
         log(`🔄 Retrying walk to ${expected}...`);
