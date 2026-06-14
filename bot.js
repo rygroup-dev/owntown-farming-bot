@@ -1395,6 +1395,13 @@ function getSnapshot() {
     posX: Math.round(pos.x), posZ: Math.round(pos.z),
     node: MINING_NODES[stats.currentNodeIdx % MINING_NODES.length].id,
     monster: MONSTERS[stats.currentMonsterIdx % MONSTERS.length].id,
+    nodeIdx: stats.currentNodeIdx % MINING_NODES.length,
+    monIdx: stats.currentMonsterIdx % MONSTERS.length,
+    map: {
+      zones: Object.entries(ZONE_TARGETS).map(([name, p]) => ({ name, x: p.x, z: p.z })),
+      nodes: MINING_NODES.map(n => ({ x: n.pos.x, z: n.pos.z })),
+      monsters: MONSTERS.map(m => ({ x: m.pos.x, z: m.pos.z })),
+    },
     mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
     crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
     market, log: LOG_RING.slice(-40), hourly: getHourly(12),

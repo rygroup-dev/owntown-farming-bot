@@ -96,12 +96,14 @@ pre{background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:1
    <div class="row"><span>👹 Boss claims</span><b id="boss">—</b></div>
    <div class="row"><span>⚠️ Errors</span><b id="err">—</b></div>
  </div>
+ <div class="card" style="grid-column:1/-1"><h2>🗺️ Live map — posisi karakter</h2><canvas id="map" height="320"></canvas></div>
  <div class="card" style="grid-column:1/-1"><h2>📈 Profit / hour — last 12h</h2><canvas id="chart" height="200"></canvas></div>
  <div class="card" style="grid-column:1/-1"><h2>📊 Market prices</h2><div id="market" class="mono">—</div></div>
  <div class="card" style="grid-column:1/-1"><h2>📜 Recent log</h2><pre id="log">—</pre></div>
 </div><div class="foot">auto-refresh 5s · Owntown Farming Bot</div></div>
 <script>
 const KEY="__KEY__";
+let lastData=null;
 const $=id=>document.getElementById(id);
 function fmt(n){return (n==null?'—':Number(n).toLocaleString())}
 async function tick(){
@@ -133,9 +135,49 @@ async function tick(){
   $('flips').textContent=fmt(d.flips);$('crafts').textContent=fmt(d.crafted);$('boss').textContent=fmt(d.bossClaims);
   $('err').textContent=fmt(d.errors);
   $('market').textContent=d.market||'(no data yet)';
+  lastData=d;
   drawChart(d.hourly||[]);
   $('log').textContent=(d.log||[]).join('\\n');$('log').scrollTop=$('log').scrollHeight;
  }catch(e){$('state').textContent='⚠️ '+e.message}
+}
+function drawMap(d){
+ const c=$('map');if(!c||!d.map)return;
+ const dpr=window.devicePixelRatio||1, W=c.clientWidth||c.parentElement.clientWidth-28, H=320;
+ c.width=W*dpr;c.height=H*dpr;c.style.width=W+'px';c.style.height=H+'px';
+ const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
+ const Z=d.map.zones,N=d.map.nodes,M=d.map.monsters;
+ const pts=[...Z,...N,...M,{x:d.posX,z:d.posZ}];
+ let minX=Math.min(...pts.map(p=>p.x)),maxX=Math.max(...pts.map(p=>p.x));
+ let minZ=Math.min(...pts.map(p=>p.z)),maxZ=Math.max(...pts.map(p=>p.z));
+ const pad=18, mx=(maxX-minX)||1, mz=(maxZ-minZ)||1;
+ const sc=Math.min((W-pad*2)/mx,(H-pad*2)/mz);
+ const ox=(W-mx*sc)/2, oz=(H-mz*sc)/2;
+ const T=(px,pz)=>[ox+(px-minX)*sc, oz+(pz-minZ)*sc];
+ // backdrop grid
+ x.fillStyle='#0a0e16';x.fillRect(0,0,W,H);
+ x.strokeStyle='#19223a';x.lineWidth=1;
+ for(let gx=0;gx<=8;gx++){const px=pad+(W-2*pad)*gx/8;x.beginPath();x.moveTo(px,0);x.lineTo(px,H);x.stroke();}
+ for(let gz=0;gz<=6;gz++){const pz=pad+(H-2*pad)*gz/6;x.beginPath();x.moveTo(0,pz);x.lineTo(W,pz);x.stroke();}
+ // zones (blue labelled)
+ x.font='10px system-ui';x.textBaseline='middle';
+ Z.forEach(z=>{const[px,pz]=T(z.x,z.z);x.fillStyle='#2a3c63';x.beginPath();x.arc(px,pz,4,0,7);x.fill();
+   x.fillStyle='#7da0d8';x.textAlign='left';x.fillText(z.name,px+7,pz);});
+ // mining nodes (orange squares; current = bright)
+ N.forEach((n,i)=>{const[px,pz]=T(n.x,n.z);x.fillStyle=(d.nodeIdx===i)?'#ffcf5c':'#7a5a1e';x.fillRect(px-3,pz-3,6,6);});
+ // monsters (red dots; current = bright)
+ M.forEach((m,i)=>{const[px,pz]=T(m.x,m.z);x.fillStyle=(d.monIdx===i)?'#ff5c5c':'#7a2727';x.beginPath();x.arc(px,pz,3.5,0,7);x.fill();});
+ // player (glowing green)
+ const[ppx,ppz]=T(d.posX,d.posZ);
+ const t=(Date.now()%1500)/1500, r=6+t*8;
+ x.beginPath();x.arc(ppx,ppz,r,0,7);x.fillStyle='rgba(61,220,132,'+(0.35*(1-t))+')';x.fill();
+ x.beginPath();x.arc(ppx,ppz,6,0,7);x.fillStyle='#3ddc84';x.fill();
+ x.strokeStyle='#0a0e16';x.lineWidth=2;x.stroke();
+ // legend
+ x.font='10px system-ui';x.textAlign='left';
+ x.fillStyle='#3ddc84';x.fillText('● you',10,H-26);
+ x.fillStyle='#ffcf5c';x.fillText('■ node',60,H-26);
+ x.fillStyle='#ff5c5c';x.fillText('● monster',115,H-26);
+ x.fillStyle='#7da0d8';x.fillText('● zone',185,H-26);
 }
 function drawChart(data){
  const c=$('chart');if(!c)return;
@@ -161,6 +203,7 @@ function drawChart(data){
  });
 }
 tick();setInterval(tick,5000);
+(function anim(){ if(lastData)drawMap(lastData); requestAnimationFrame(anim); })();
 </script></body></html>`;
 
 module.exports = { startDashboard };
