@@ -57,7 +57,7 @@ header h1{font-size:16px;margin:0}.dot{width:10px;height:10px;border-radius:50%;
 pre{background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:280px;overflow:auto;font-size:11.5px;color:#bcd}
 .foot{color:var(--mut);font-size:12px;text-align:center;padding:14px}
 </style></head><body>
-<header><span class="dot" id="dot"></span><h1>🏭 Owntown Bot</h1><span class="pill" id="state">…</span><span class="pill" id="uptime"></span><span class="pill" id="upd"></span></header>
+<header><span class="dot" id="dot"></span><h1>🏭 Owntown Bot</h1><span class="pill" id="state">…</span><span class="pill" id="now" style="color:#5cffa0;border-color:#1f9e5a">…</span><span class="pill" id="uptime"></span><span class="pill" id="upd"></span></header>
 <div class="wrap"><div class="grid">
  <div class="card"><h2>💰 Wallet & Balance</h2>
    <div class="row"><span>In-game</span><b class="big grn" id="bal">—</b></div>
@@ -79,7 +79,13 @@ pre{background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:1
    <div class="row"><span>HP</span><b id="hp">—</b></div>
    <div class="row"><span>Stamina</span><b id="sta">—</b></div>
    <div class="row"><span>Zone</span><b id="zone">—</b></div>
+   <div class="row"><span>Position</span><b id="pos">—</b></div>
    <div class="row"><span>Inventory</span><b id="inv">—</b></div>
+ </div>
+ <div class="card"><h2>🎯 Live target</h2>
+   <div class="row"><span>Doing</span><b class="grn" id="doing">—</b></div>
+   <div class="row"><span>Mining node</span><b id="node">—</b></div>
+   <div class="row"><span>Monster</span><b id="mon">—</b></div>
  </div>
  <div class="card"><h2>⚙️ Activity</h2>
    <div class="row"><span>⛏ Mined</span><b id="mined">—</b></div>
@@ -118,6 +124,11 @@ async function tick(){
   $('lvl').textContent=d.level;$('xp').textContent=fmt(d.xp);
   $('hp').textContent=d.hp+' / '+d.maxHp;$('sta').textContent=d.stamina;
   $('zone').textContent=d.zone;$('inv').textContent=d.invCount+' / '+d.carryCap;
+  $('pos').textContent='('+d.posX+', '+d.posZ+')';
+  const acts={mining:'⛏ Mining',fishing:'🎣 Fishing',combat:'⚔ Combat',pvp:'🥊 PvP',idle:'💤 Idle',walking:'🚶 Walking'};
+  const al=acts[d.activity]||('🎮 '+d.activity);
+  $('now').textContent=al;$('doing').textContent=al;
+  $('node').textContent=d.node;$('mon').textContent=d.monster;
   $('mined').textContent=fmt(d.mined);$('fished').textContent=fmt(d.fished);$('kills').textContent=fmt(d.kills);
   $('flips').textContent=fmt(d.flips);$('crafts').textContent=fmt(d.crafted);$('boss').textContent=fmt(d.bossClaims);
   $('err').textContent=fmt(d.errors);

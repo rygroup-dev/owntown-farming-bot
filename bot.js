@@ -42,6 +42,7 @@ function notifySys(m) { if (!config.notifyProfitOnly) tg.send(m); }  // routine/
 // ============ AUTOPILOT STATE ============
 let paused = false;
 let stopped = false;          // true = game session fully off (user plays manually); no auto-reconnect
+let currentActivity = 'idle'; // live: what the bot is doing right now
 let lastActivity = Date.now();        // updated on any meaningful game result
 let activeSocket = null;              // current live socket (for watchdog/commands)
 let lastCycleStart = Date.now();
@@ -771,6 +772,7 @@ function freshSell(sock, cb) {
 // ============ ACTIONS (v23: ENHANCED) ============
 function doActions(sock, type) {
   if(!connected) return;
+  currentActivity = type;
   const cfg = ACTIONS[type];
   let count = 0;
   let lastCatchTime = Date.now();
@@ -1389,6 +1391,10 @@ function getSnapshot() {
     totalEarned: p.totalEarned, rate: p.rate, earnedQuick: stats.earnedQuick, earnedMarket: stats.earnedMarket,
     pvpEarnings: stats.pvpEarnings, itemsSold: stats.totalItemsSold,
     level, xp: stats.xp, hp, maxHp, stamina, zone, invCount: inventory.length, carryCap: CARRY_CAP,
+    activity: paused ? 'paused' : (stopped ? 'stopped (manual play)' : (connected ? currentActivity : 'offline')),
+    posX: Math.round(pos.x), posZ: Math.round(pos.z),
+    node: MINING_NODES[stats.currentNodeIdx % MINING_NODES.length].id,
+    monster: MONSTERS[stats.currentMonsterIdx % MONSTERS.length].id,
     mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
     crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
     market, log: LOG_RING.slice(-40), hourly: getHourly(12),
