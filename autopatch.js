@@ -92,7 +92,7 @@ function selectRecipe(entry) {
 
 // Backs up, patches the recipe's region, runs `node --check`; rolls back on parse failure.
 // Process restart + connect-verification rollback is handled by the caller (bot.js).
-function applyRecipe(recipe, { sourcePath, backupDir, entry }) {
+function applyRecipe(recipe, { sourcePath, backupDir, entry, maxBackups = 10 }) {
   const original = fs.readFileSync(sourcePath, 'utf8');
   const stamp = Date.now();
   const backup = path.join(backupDir, `${path.basename(sourcePath)}.bak.${stamp}`);
@@ -106,9 +106,11 @@ function applyRecipe(recipe, { sourcePath, backupDir, entry }) {
     const body = original.slice(si + start.length, ei).replace(/^\n|\n$/g, '');
     const newBody = recipe.patch(body, entry);
     const patched = replaceRegion(original, recipe.region, newBody);
+    if (patched === original) { return { ok: true, noop: true, backup }; } // nothing changed → caller skips restart
     fs.writeFileSync(sourcePath, patched);
     sourceMutated = true;
     execFileSync(process.execPath, ['--check', sourcePath]); // throws on parse error
+    pruneBackups(backupDir, path.basename(sourcePath), maxBackups);
     return { ok: true, backup, recipe: recipe.name };
   } catch (err) {
     if (sourceMutated) { try { fs.writeFileSync(sourcePath, original); } catch {} } // rollback
@@ -116,4 +118,15 @@ function applyRecipe(recipe, { sourcePath, backupDir, entry }) {
   }
 }
 
-module.exports = { replaceRegion, bumpConstant, RateLimiter, RECIPES, selectRecipe, applyRecipe, AUTOPATCH_THRESHOLD };
+// Keep only the `keep` most recent `<base>.bak.*` files in dir; delete older ones.
+function pruneBackups(dir, base, keep) {
+  let files;
+  try { files = fs.readdirSync(dir).filter(f => f.startsWith(base + '.bak.')); } catch { return; }
+  if (files.length <= keep) return;
+  files.sort(); // names end with Date.now() → lexical sort == chronological for equal-length timestamps
+  for (const f of files.slice(0, files.length - keep)) {
+    try { fs.unlinkSync(path.join(dir, f)); } catch {}
+  }
+}
+
+module.exports = { replaceRegion, bumpConstant, RateLimiter, RECIPES, selectRecipe, applyRecipe, AUTOPATCH_THRESHOLD, pruneBackups };

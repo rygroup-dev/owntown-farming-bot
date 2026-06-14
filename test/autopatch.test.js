@@ -100,3 +100,30 @@ test('blacklist-zone recipe skips unsafe zone names (quote/backslash injection g
   assert.strictEqual(fs.readFileSync(src, 'utf8'), original);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('applyRecipe returns noop:true and does not change the file when region is unchanged', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-noop-'));
+  const src = path.join(dir, 'fixture.js');
+  const original = [
+    '// === AUTOPATCH:ERROR_HANDLERS:START ===',
+    "const KNOWN_ERROR_CODES = ['COOLDOWN'];",
+    '// === AUTOPATCH:ERROR_HANDLERS:END ===',
+  ].join('\n');
+  fs.writeFileSync(src, original);
+  const recipe = selectRecipe({ code: 'COOLDOWN', count: AUTOPATCH_THRESHOLD }); // already present → no-op
+  const res = applyRecipe(recipe, { sourcePath: src, backupDir: dir, entry: { code: 'COOLDOWN', count: 5 } });
+  assert.strictEqual(res.ok, true);
+  assert.strictEqual(res.noop, true);
+  assert.strictEqual(fs.readFileSync(src, 'utf8'), original);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('pruneBackups keeps only the N most recent backups', () => {
+  const { pruneBackups } = require('../autopatch');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-prune-'));
+  for (const ts of ['1000', '1001', '1002', '1003', '1004']) fs.writeFileSync(path.join(dir, `bot.js.bak.${ts}`), 'x');
+  pruneBackups(dir, 'bot.js', 2);
+  const left = fs.readdirSync(dir).sort();
+  assert.deepStrictEqual(left, ['bot.js.bak.1003', 'bot.js.bak.1004']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -88,6 +88,11 @@ function runAutoPatch(recipe, entry) {
     notify(`🔧 <b>AutoPatch aborted</b>\nRecipe: ${recipe.name}\nError: ${res.error}`);
     return;
   }
+  if (res.noop) {
+    log(`🔧 autopatch ${recipe.name}: no-op (region already up to date) — no restart`);
+    errorBus.setStatus(entry.sig, 'patched', recipe.name); // mark handled so we don't retry
+    return;
+  }
   // Record a pending patch so the next boot verifies connect within 60s, else rolls back.
   // (PENDING_PATCH is last-write-wins; the rate limiter makes concurrent patches effectively impossible.)
   try { fs.writeFileSync(PENDING_PATCH, JSON.stringify({ recipe: recipe.name, sig: entry.sig, backup: res.backup, at: Date.now() })); } catch {}
