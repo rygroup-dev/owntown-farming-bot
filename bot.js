@@ -1286,7 +1286,7 @@ async function startBot() {
     touchActivity();
     if(retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     log('Connected!');
-    notify(`🟢 <b>Connected</b> to ${GAME_HOST}`);
+    notify(`🟢 <b>Connected</b> — farming dimulai 🎮\n<i>${GAME_HOST}</i>`);
     activeSocket = socket;
     let started = false;
     socket.on('player:correction', function onCorr(d) {
@@ -1338,25 +1338,35 @@ async function startBot() {
 }
 
 // ============ STATUS SUMMARY (shared by report + /status) ============
+function fmt(n) { return Number(n || 0).toLocaleString('en-US'); }
 function buildStatusText() {
   const p = getProfitSummary();
-  const fishItems = inventory.filter(i => i.defId.startsWith('fish_'));
-  const matItems = inventory.filter(i => i.defId.startsWith('mat_'));
-  const fishValue = fishItems.reduce((s,i) => s + (PRICE_FLOOR[i.defId]||1) * i.qty, 0);
-  const matValue = matItems.reduce((s,i) => s + (PRICE_FLOOR[i.defId]||1) * i.qty, 0);
-  const conn = connected ? '🟢 online' : '🔴 offline';
-  const state = paused ? '⏸️ PAUSED' : '▶️ farming';
+  const conn = connected ? '🟢' : '🔴';
+  const state = paused ? '⏸️ paused' : (connected ? '▶️ farming' : '⏳ offline');
+  const up = fmtUptime(Date.now() - stats.startTime);
   return [
-    `📊 <b>OWNTOWN [${p.hours}h]</b> — ${conn} ${state}`,
-    `⛏${stats.mined} 🎣${stats.fished} ⚔${stats.kills} | Lv${level} XP${stats.xp}`,
-    `💰 QS:+${stats.earnedQuick} MKT:+${stats.earnedMarket} PvP:+${stats.pvpEarnings} <b>Total:${p.totalEarned}</b>`,
-    `💵 Rate: ${p.rate}/h | Sold: ${p.itemsSold} items`,
-    `💰 Bal:${balance.toFixed(2)} | Daily:${dailyEarned}/${DAILY_EARN_CAP} | 🏦 Bank:${stats.bankBalance}`,
-    `❤️ HP:${hp}/${maxHp} | STA:${stamina} | 📦 ${inventory.length}/${CARRY_CAP}`,
-    `🐟 Fish:${fishItems.length}(~${fishValue}) 🧱 Mats:${matItems.length}(~${matValue}) ⏸️ Held:${stats.holdCount}`,
-    `⚔️ PvP:${stats.pvpWins}w 🏠 Prop:+${stats.propertyEarnings} 👹 Boss:${stats.bossClaims} 🔨 Craft:${stats.crafted}`,
-    `🛒 Flip:${stats.itemsBought} 🔔 Notif:${stats.notifications} ⚠️ Err:${stats.errors}`,
-    `🔧 WrongZone:${stats.wrongZone} FishTO:${stats.fishingTimeouts} Zone:${zone}`,
+    `${conn} <b>OWNTOWN BOT</b> · ${state}`,
+    `<i>⏱ ${up}  ·  📍 ${zone}  ·  🧍 Lv ${level}</i>`,
+    ``,
+    `💰 <b>Profit</b>`,
+    '<pre>' +
+      `Total      ${fmt(p.totalEarned)} OTWN\n` +
+      `Rate       ${fmt(p.rate)} /h\n` +
+      `QuickSell  +${fmt(stats.earnedQuick)}\n` +
+      `Market     +${fmt(stats.earnedMarket)}\n` +
+      `PvP        +${fmt(stats.pvpEarnings)}\n` +
+      `Items sold ${fmt(p.itemsSold)}` +
+    '</pre>',
+    `🏦 <b>Wallet</b>`,
+    '<pre>' +
+      `Balance    ${fmt(Math.round(balance))}\n` +
+      `Bank       ${fmt(stats.bankBalance)}\n` +
+      `Daily      ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}` +
+    '</pre>',
+    `🎒 <b>Character & Activity</b>`,
+    `❤️ ${hp}/${maxHp}   ⚡ ${stamina}   📦 ${inventory.length}/${CARRY_CAP}   ⏸ held ${stats.holdCount}`,
+    `⛏ ${fmt(stats.mined)}  🎣 ${fmt(stats.fished)}  ⚔ ${fmt(stats.kills)}  🛒 ${fmt(stats.itemsBought)}  🔨 ${fmt(stats.crafted)}  👹 ${fmt(stats.bossClaims)}`,
+    `${stats.errors ? '⚠️' : '✅'} errors ${stats.errors}   🌀 wrongzone ${stats.wrongZone}`,
   ].join('\n');
 }
 
@@ -1388,7 +1398,7 @@ startDashboard({ port: config.dashboardPort, key: DASH_KEY, getSnapshot, logger:
 
 // ============ STATUS REPORT (configurable interval) ============
 setInterval(() => {
-  log('\n' + buildStatusText().replace(/<\/?b>/g, '') + '\n');
+  log('\n' + buildStatusText().replace(/<[^>]+>/g, '') + '\n');
   notify(buildStatusText());
 }, Math.max(1, config.reportIntervalMin) * 60000);
 
@@ -1491,5 +1501,5 @@ process.on('unhandledRejection', (reason) => {
 // ============ BOOT ============
 log('🚀 Starting v23 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram + Autopilot...');
 tg.startPolling();
-notify('🚀 <b>Owntown bot starting</b> — connecting to game...');
+notify('🚀 <b>Owntown Bot</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /dashboard untuk panel live</i>');
 startBot();
