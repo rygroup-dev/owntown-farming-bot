@@ -559,15 +559,15 @@ function vehicleBuy(sock, defId) {
   }
 }
 
-// ============ MARKET FLIP (v23.1: FIXED!) ============
+// ============ MARKET FLIP (smart, aggressive, balance-safe) ============
 let lastFlipTime = 0;
-const FLIP_COOLDOWN = 60000;
-const FLIP_MAX_COST = 200;
-const FLIP_MIN_PROFIT = 50;
+
+function spendableBalance() { return balance - config.balanceReserve; }
 
 function checkFlipOpportunities(sock, listings) {
+  if(!config.flipEnabled) return false;
   if(!MY_PLAYER_ID) return false; // don't flip until we know our own id (avoid buying own listings)
-  if(Date.now() - lastFlipTime < FLIP_COOLDOWN) return false;
+  if(Date.now() - lastFlipTime < config.flipCooldownSec * 1000) return false;
   let bestFlip = null, bestProfit = 0;
   for(const l of listings) {
     if(l.sellerPlayerId === MY_PLAYER_ID || l.status !== 'active') continue;
@@ -576,22 +576,75 @@ function checkFlipOpportunities(sock, listings) {
     if(!marketPrice || marketPrice < 5) continue;
     const ppu = l.price / l.qty;
     const listingFee = Math.max(5, Math.round(l.price * 0.05));
-    const resaleRevenue = Math.round(marketPrice * l.qty * 0.92);
+    const resaleRevenue = Math.round(marketPrice * l.qty * 0.92); // after ~8% resale fee
     const totalCost = l.price + listingFee;
     const profit = resaleRevenue - totalCost;
-    if(ppu < marketPrice * 0.4 && l.price <= FLIP_MAX_COST && profit >= FLIP_MIN_PROFIT && balance >= totalCost) {
+    // aggressive: buy if priced under flipUnderprice of market, within budget + reserve
+    if(ppu < marketPrice * config.flipUnderprice && l.price <= config.flipMaxCost &&
+       profit >= config.flipMinProfit && spendableBalance() >= totalCost) {
       if(profit > bestProfit) { bestProfit = profit; bestFlip = { listing: l, ppu, marketPrice, profit, totalCost }; }
     }
   }
   if(bestFlip) {
     const l = bestFlip.listing;
     log(`🔄 FLIP: ${l.defId} x${l.qty} @${l.price} (ppu:${bestFlip.ppu.toFixed(1)} mkt:${bestFlip.marketPrice} profit:${bestFlip.profit})`);
+    notify(`🔄 <b>Flip beli</b> ${cleanName(l.defId)} x${l.qty} @${l.price}\n<i>market ${bestFlip.marketPrice} · est profit +${bestFlip.profit}</i>`);
     sock.emit('marketplace:buy', { listingId: l.id });
-    stats.itemsBought++;
+    stats.itemsBought++; stats.itemsFlipped++;
     lastFlipTime = Date.now();
     return true;
   }
   return false;
+}
+
+// ============ AUTO-POWERUP (buy items that help leveling / sustained farming) ============
+// item -> { maxPrice: max OTWN/unit, maxQty: stop buying once we hold this many, equip?: weapon slot }
+const POWERUP_WANTS = {
+  kit_repair:        { maxPrice: 60,   maxQty: 5 },   // keep mining tool repaired
+  med_patch:         { maxPrice: 70,   maxQty: 6 },   // heal HP
+  food_ember_skewer: { maxPrice: 35,   maxQty: 10 },  // stamina -> more actions
+  food_volt_noodles: { maxPrice: 35,   maxQty: 10 },
+  wpn_rail_lance:    { maxPrice: 2500, maxQty: 1, equip: true }, // stronger weapon -> more kills -> XP
+};
+let lastPowerupTime = 0;
+function invCount(defId) { return inventory.filter(i => i.defId === defId).reduce((s, i) => s + i.qty, 0); }
+
+function checkPowerupBuys(sock, listings) {
+  if(!config.powerupEnabled || !MY_PLAYER_ID) return false;
+  if(Date.now() - lastPowerupTime < 15000) return false;
+  for(const [defId, want] of Object.entries(POWERUP_WANTS)) {
+    if(invCount(defId) >= want.maxQty) continue;
+    // cheapest active listing of this item within budget
+    let best = null;
+    for(const l of listings) {
+      if(l.sellerPlayerId === MY_PLAYER_ID || l.status !== 'active' || l.defId !== defId) continue;
+      const ppu = l.price / (l.qty || 1);
+      if(ppu <= want.maxPrice && spendableBalance() >= l.price) {
+        if(!best || l.price < best.price) best = l;
+      }
+    }
+    if(best) {
+      log(`🆙 POWERUP buy: ${defId} x${best.qty} @${best.price}`);
+      notify(`🆙 <b>Beli powerup</b> ${cleanName(defId)} x${best.qty||1} @${best.price}`);
+      sock.emit('marketplace:buy', { listingId: best.id });
+      stats.itemsBought++;
+      if(want.equip) pendingEquip = defId; // try to equip after it lands in inventory
+      lastPowerupTime = Date.now();
+      return true;
+    }
+  }
+  return false;
+}
+let pendingEquip = null;
+function tryEquipPending(sock) {
+  if(!pendingEquip) return;
+  const item = inventory.find(i => i.defId === pendingEquip && i.instanceId);
+  if(item) {
+    sock.emit('equipment:set', { instanceId: item.instanceId, slot: 'weapon' });
+    log(`🗡️ Equip ${pendingEquip}`);
+    notify(`🗡️ <b>Equip</b> ${cleanName(pendingEquip)}`);
+    pendingEquip = null;
+  }
 }
 
 // ============ WORLD BOSS (v23: FULL) ============
@@ -1046,6 +1099,7 @@ async function startBot() {
       socket.emit('inventory:repair', { instanceId: tool.instanceId });
       stats.repaired++;
     }
+    tryEquipPending(socket); // equip a just-bought weapon once it lands in inventory
   });
 
   // === MARKETPLACE ===
@@ -1053,8 +1107,8 @@ async function startBot() {
     if(d.listings) {
       myActiveListings = d.listings.filter(l => l.sellerPlayerId === MY_PLAYER_ID && l.status === 'active');
       scanMarketPrices(d.listings);
-      // v23: Check flip opportunities
-      checkFlipOpportunities(socket, d.listings);
+      // smart auto-buy: flip underpriced for profit, then buy powerup/upgrade items
+      if(!checkFlipOpportunities(socket, d.listings)) checkPowerupBuys(socket, d.listings);
     }
   });
 
@@ -1426,6 +1480,9 @@ function getSnapshot() {
       watchdogMin: config.watchdogStuckMin,
       profitOnly: config.notifyProfitOnly,
       dailyCap: DAILY_EARN_CAP,
+      flip: config.flipEnabled ? `< ${Math.round(config.flipUnderprice*100)}% mkt, max ${config.flipMaxCost}, cd ${config.flipCooldownSec}s` : 'off',
+      reserve: config.balanceReserve,
+      powerup: config.powerupEnabled ? 'on' : 'off',
     },
   };
 }

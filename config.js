@@ -68,6 +68,17 @@ const config = {
   // Dashboard login
   dashUser: process.env.DASH_USER || 'admin',
   dashPass: process.env.DASH_PASS || '',
+
+  // Trading / flip strategy (aggressive auto-buy underpriced)
+  flipEnabled: (process.env.FLIP_ENABLED || 'true').toLowerCase() === 'true',
+  flipMaxCost: parseInt(process.env.FLIP_MAX_COST || '5000', 10),      // max OTWN per flip
+  flipCooldownSec: parseInt(process.env.FLIP_COOLDOWN_SEC || '20', 10),
+  flipUnderprice: parseFloat(process.env.FLIP_UNDERPRICE || '0.6'),    // buy if ppu < this * market
+  flipMinProfit: parseInt(process.env.FLIP_MIN_PROFIT || '80', 10),
+  balanceReserve: parseInt(process.env.BALANCE_RESERVE || '2000', 10), // never spend below this
+
+  // Auto-powerup: buy items that help leveling/sustained farming
+  powerupEnabled: (process.env.POWERUP_ENABLED || 'true').toLowerCase() === 'true',
   watchdogStuckMin: parseInt(process.env.WATCHDOG_STUCK_MIN || '5', 10),
   logPath: process.env.LOG_PATH || '/tmp/owntown_v23.log',
   tokenPath: process.env.TOKEN_PATH || '/tmp/owntown_token.txt',

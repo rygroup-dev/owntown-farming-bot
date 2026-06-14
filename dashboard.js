@@ -202,7 +202,10 @@ section{display:none}section.active{display:block}
     <div class="row"><span>Report interval</span><b id="s_rep">—</b></div>
     <div class="row"><span>Watchdog</span><b id="s_wd">—</b></div>
     <div class="row"><span>Notif profit-only</span><b id="s_po">—</b></div>
-    <div class="row"><span>Daily cap</span><b id="s_cap">—</b></div></div>
+    <div class="row"><span>Daily cap</span><b id="s_cap">—</b></div>
+    <div class="row"><span>Auto-flip</span><b id="s_flip">—</b></div>
+    <div class="row"><span>Balance reserve</span><b id="s_res">—</b></div>
+    <div class="row"><span>Auto-powerup</span><b id="s_pwr">—</b></div></div>
   <div class="card"><h2>🤖 Kontrol via Telegram</h2>
     <div class="mono" style="line-height:1.9">/start · /stop · /status · /balance<br>/inventory · /income · /health<br>/errors · /logs · /schedule · /ping<br>/pause · /resume · /restart · /update</div>
     <p style="color:var(--mut);font-size:12px;margin:10px 0 0">Edit setting via <code>.env</code> di VPS lalu /restart.</p></div>
@@ -265,6 +268,7 @@ async function tick(){
   $('s_sched').textContent=s.schedule;$('s_jit').textContent='±'+s.jitter+'%';
   $('s_rep').textContent=s.reportMin+' min';$('s_wd').textContent=s.watchdogMin+' min';
   $('s_po').textContent=s.profitOnly?'ON':'OFF';$('s_cap').textContent=fmt(s.dailyCap);
+  $('s_flip').textContent=s.flip;$('s_res').textContent=fmt(s.reserve);$('s_pwr').textContent=s.powerup;
   drawChart(d.hourly||[]);
  }catch(e){$('state').textContent='⚠️ '+e.message}
 }
