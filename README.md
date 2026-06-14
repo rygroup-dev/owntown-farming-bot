@@ -1,6 +1,30 @@
-# 🏭 Owntown Farming Bot v23.1
+<div align="center">
+
+# 🏭 Owntown Farming Bot
+
+### a **RY GROUP** project
 
 Full-featured automated farming bot for [Owntown.fun](https://owntown.fun) — a Solana-based MMO game.
+Mining · Fishing · Combat · PvP · Marketplace · Banking · Crafting — plus a **self-fix system** and full **Telegram** control + **web dashboard**.
+
+</div>
+
+## ⚡ One-line Install
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+```
+
+The installer asks for **two things only** — your wallet **passphrase** (Solana private key, base58) and your **Telegram bot token** — then it clones, installs deps, writes a locked-down `.env`, derives your wallet address, auto-generates dashboard credentials, and starts the bot as a service.
+
+Prefer non-interactive? Pass them inline:
+
+```bash
+WALLET_PRIVATE_KEY=your_base58_key TELEGRAM_BOT_TOKEN=123456:AA... \
+  bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+```
+
+> 🔒 Your private key never leaves the machine — it is written only to `.env` (chmod 600, git-ignored) and used locally to sign the game's auth challenge.
 
 ## ⚡ Features
 
@@ -15,12 +39,12 @@ Full-featured automated farming bot for [Owntown.fun](https://owntown.fun) — a
 - **Market Intelligence** — Scans all marketplace listings, tracks prices, detects trends (rising/falling/stable)
 - **Dynamic Pricing** — Undercuts best price by 8%, respects price floors
 - **Smart Sell Decisions** — Marketplace vs QuickSell vs HOLD based on market depth and trends
-- **Market Flipping** — Buys underpriced items (< 40% market value) with safety guards:
+- **Market Flipping** — Buys clearly underpriced items (< 45% market value) with safety guards:
   - 60s cooldown between flips
-  - Max 200 OTWN per flip
-  - Min 50 OTWN profit after fees
+  - Max 1000 OTWN per flip · min 150 OTWN profit after fees
+  - Daily buy cap + balance reserve (never spend below reserve)
   - Uses actual market price (not inflated floors)
-- **sellAll** — Bulk sells low-value materials via terminal
+- **Targeted QuickSell** — only cheap mats are terminal-sold per-item (`quickSellSafe`); held valuables (fish, cores) are never dumped by a blanket sellAll
 - **Price Floor Protection** — Never sells below minimum prices
 
 ### Combat & PvP
@@ -53,10 +77,23 @@ Full-featured automated farming bot for [Owntown.fun](https://owntown.fun) — a
 
 ### Infrastructure
 - **Auto-Authentication** — REST API challenge-response, JWT refresh before expiry
-- **Auto-Reconnect** — 30s reconnect on disconnect
-- **Token Management** — Auto-refresh 1 min before expiry
-- **Error Recovery** — Reconnects after 10 consecutive errors
+- **Auto-Reconnect** — configurable backoff on disconnect
+- **Token Management** — Auto-refresh before expiry
+- **Error Recovery** — Reconnects after consecutive errors
 - **Economy Ledger** — Tracks all transactions
+
+### 🩹 Self-Fix System (deterministic, no LLM)
+A three-layer system so problems are never silently missed and recurring ones get handled automatically:
+- **L1 — Error knowledge base** (`errorbus.js`): every error is captured to `errors.json` with a stable signature, count, and context.
+- **L2 — Runtime self-heal** (`selfheal.js`): recurring patterns adjust behaviour live (e.g. avoid a bad zone, raise reconnect backoff) — no source edit.
+- **L3 — AutoPatch** (`autopatch.js`): for recurring patch-able patterns, the bot edits its own marked source regions, passes a `node --check` gate, restarts, and **rolls back automatically** if it can't reconnect within 60s (the crash handler rolls back too — no crash-loops). Rate-limited to 1 patch / 10 min.
+
+Inspect it live with `/selfix` and `/errors` on Telegram. Run the unit suite with `npm test`.
+
+### 📱 Telegram Control + Web Dashboard
+- Full command set: `/status` (split errors/reconnects/wrongzone), `/balance`, `/inventory`, `/income`, `/health`, `/errors`, `/selfix`, `/schedule`, `/daily`, `/pause` `/resume`, `/start` `/stop`, `/restart`, `/help`.
+- Profit & sales digests, level-up / boss / funding alerts, balance-drop watcher.
+- Web dashboard on port 8899 (cookie login) with live mini-map, profit chart, inventory & trade tabs.
 
 ## 📊 API Endpoints Used
 
@@ -102,11 +139,11 @@ Full-featured automated farming bot for [Owntown.fun](https://owntown.fun) — a
 | **Spectator** | `spectator:follow` |
 | **Toast** | `toast` |
 
-## 🚀 Quick Start
+## 🚀 Manual Install
 
 ```bash
 # Clone
-git clone https://github.com/ulsreall/owntown-farming-bot.git
+git clone https://github.com/rygroup-dev/owntown-farming-bot.git
 cd owntown-farming-bot
 
 # Install
@@ -114,10 +151,11 @@ npm install
 
 # Configure
 cp .env.example .env
-# Edit .env with your wallet private key (base58)
+# Edit .env: set WALLET_PRIVATE_KEY (passphrase) and TELEGRAM_BOT_TOKEN
+# (WALLET_ADDRESS auto-derives; dashboard key/pass can be left for you to set)
 
 # Run
-npm start
+npm start          # or: npm test  to run the unit suite
 ```
 
 ## ⚙️ Configuration
@@ -199,4 +237,9 @@ MIT — See [LICENSE](LICENSE)
 
 ---
 
-Built with ❤️ by [@itseywacc](https://x.com/itseywacc)
+<div align="center">
+
+**RY GROUP** — packaged, hardened & maintained distribution
+Original bot foundations by [@itseywacc](https://x.com/itseywacc) · MIT
+
+</div>

@@ -1,5 +1,5 @@
 [Unit]
-Description=Owntown Farming Bot (autopilot + Telegram)
+Description=RY GROUP — Owntown Farming Bot (autopilot + Telegram)
 After=network-online.target
 Wants=network-online.target
 
