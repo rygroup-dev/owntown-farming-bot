@@ -5,6 +5,8 @@ const nacl = require('tweetnacl');
 const bs58 = require('bs58').default || require('bs58');
 const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
+const { startDashboard } = require('./dashboard');
+const crypto = require('crypto');
 
 // ============ CONFIG (env-driven, see .env) ============
 const TOKEN_PATH = config.tokenPath;
@@ -1336,6 +1338,32 @@ function buildStatusText() {
   ].join('\n');
 }
 
+// ============ DASHBOARD SNAPSHOT ============
+function fmtUptime(ms) {
+  const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm';
+}
+function getSnapshot() {
+  const p = getProfitSummary();
+  const market = Object.entries(marketPrices).filter(([k]) => PRICE_FLOOR[k])
+    .map(([k, v]) => { const t = getPriceTrend(k); const i = t === 'rising' ? '📈' : t === 'falling' ? '📉' : '➡️'; return `${k.replace('mat_', '').replace('fish_', '')}:${v}${i}`; }).join('  ');
+  return {
+    connected, paused, uptime: fmtUptime(Date.now() - stats.startTime),
+    wallet: WALLET_ADDR, balance, dailyEarned, dailyCap: DAILY_EARN_CAP, bankBalance: stats.bankBalance,
+    totalEarned: p.totalEarned, rate: p.rate, earnedQuick: stats.earnedQuick, earnedMarket: stats.earnedMarket,
+    pvpEarnings: stats.pvpEarnings, itemsSold: stats.totalItemsSold,
+    level, xp: stats.xp, hp, maxHp, stamina, zone, invCount: inventory.length, carryCap: CARRY_CAP,
+    mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
+    crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
+    market, log: LOG_RING.slice(-40),
+  };
+}
+
+// generate + persist a dashboard access key if none set
+let DASH_KEY = config.dashboardKey;
+if (!DASH_KEY) { DASH_KEY = crypto.randomBytes(8).toString('hex'); persistEnv('DASHBOARD_KEY', DASH_KEY); }
+startDashboard({ port: config.dashboardPort, key: DASH_KEY, getSnapshot, logger: log });
+
 // ============ STATUS REPORT (configurable interval) ============
 setInterval(() => {
   log('\n' + buildStatusText().replace(/<\/?b>/g, '') + '\n');
@@ -1386,6 +1414,19 @@ tg.on('start', () => {
   if (connected) { notify('▶️ Already farming. /status for stats.'); return; }
   notify('🚀 Connecting + starting farming now...');
   startBot();
+});
+let publicIp = '';
+function getPublicIp() {
+  return new Promise((resolve) => {
+    https.get('https://api.ipify.org', (r) => { let d = ''; r.on('data', c => d += c); r.on('end', () => resolve(d.trim())); })
+      .on('error', () => resolve('')).setTimeout(8000, function () { this.destroy(); resolve(''); });
+  });
+}
+tg.on('dashboard', async () => {
+  if (!publicIp) publicIp = await getPublicIp();
+  const host = publicIp || 'YOUR_VPS_IP';
+  const link = `http://${host}:${config.dashboardPort}/?key=${DASH_KEY}`;
+  notify(`🖥️ <b>Dashboard</b>\n${link}\n\n(Live: wallet, saldo, profit, market, log — auto-refresh 5s)`);
 });
 tg.on('status', () => notify(buildStatusText()));
 tg.on('stats', () => notify(buildStatusText()));

@@ -51,6 +51,10 @@ const config = {
   telegramToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
 
+  // Dashboard
+  dashboardPort: parseInt(process.env.DASHBOARD_PORT || '8899', 10),
+  dashboardKey: process.env.DASHBOARD_KEY || '',
+
   // Behaviour
   gameHost: process.env.GAME_HOST || 'owntown.fun',
   reportIntervalMin: parseInt(process.env.REPORT_INTERVAL_MIN || '30', 10),
