@@ -354,6 +354,10 @@ function getSellDecision(defId, qty) {
   return { action: 'QUICKSELL', price: qsPrice };
 }
 
+// ---- trade history + pending-sale notifier ----
+let tradeLog = [];      // {t, defId, qty, method, price, total}
+let pendingSales = [];  // batched for Telegram digest
+
 // ---- hourly profit tracking (for dashboard chart) ----
 let hourlyProfit = {}; // hourKey (epoch hours) -> OTWN earned that hour
 function bucketEarn(amount) {
@@ -381,8 +385,12 @@ function recordSale(defId, qty, method, price) {
   if(method === 'quickSell') { stats.soldQuick += qty; stats.earnedQuick += total; }
   else { stats.soldMarket += qty; stats.earnedMarket += total; }
   bucketEarn(total);
+  const rec = { t: Date.now(), defId, qty, method, price, total };
+  tradeLog.push(rec); if (tradeLog.length > 120) tradeLog.shift();
+  pendingSales.push(rec);
   log(`💰 ${method==='quickSell'?'QS':'MKT'} ${defId} x${qty} @${price} = ${total} OTWN`);
 }
+function cleanName(id) { return String(id).replace(/^(mat_|fish_|wpn_|tool_|cos_|food_|med_|kit_|pet_|permit_)/, '').replace(/_/g, ' '); }
 
 function getProfitSummary() {
   const mins = Math.floor((Date.now() - stats.startTime) / 60000);
@@ -900,12 +908,10 @@ function runNextCycle(sock) {
   const order = ['sell', 'mining', 'fishing', 'combat', 'pvp', 'mining', 'fishing', 'combat'];
   const type = order[(stats.cycles - 1) % order.length];
 
-  // Skip sell phase (disabled)
+  // Sell phase — ENABLED: list/quicksell inventory to generate income (marketplace is global)
   if(type === 'sell') {
-    stats.cycles++;
-    // But do check bank and economy during sell skip
     checkLedger(sock);
-    setTimeout(() => runNextCycle(sock), 1000);
+    doSellPhase(sock, () => { setTimeout(() => runNextCycle(sock), 1500); });
     return;
   }
 
@@ -1268,13 +1274,8 @@ async function startBot() {
   socket.on('toast', (d) => {
     if(d.kind === 'success') {
       const msg = (d.message || '').toLowerCase();
-      if(msg.includes('sold') || msg.includes('received')) {
-        const m = d.message.match(/(\d[\d,]*)\s*\$?OTWN/);
-        if(m) {
-          const amount = parseInt(m[1].replace(/,/g, ''));
-          if(amount > 0) recordSale('toast-sale', 1, 'marketplace', amount);
-        }
-      }
+      // NOTE: do NOT recordSale here — marketplace:result / sellAll:result already
+      // credit sales; recording on toast too would double-count income.
       if(msg.includes('list')) stats.listed++;
       if(msg.includes('pvp') || msg.includes('arena')) {
         log(`⚔️ PvP toast: ${d.message}`);
@@ -1404,10 +1405,21 @@ function getSnapshot() {
     },
     mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
     crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
-    market, log: LOG_RING.slice(-40), hourly: getHourly(12),
+    market, log: LOG_RING.slice(-60), hourly: getHourly(12),
     schedule: schedStatus(), errorsStreak: stats.consecutiveErrors,
     memMB: Math.round(process.memoryUsage().rss / 1048576),
-    propertyEarnings: stats.propertyEarnings,
+    propertyEarnings: stats.propertyEarnings, bankBal: stats.bankBalance,
+    canceled: stats.canceled, listed: stats.listed, repaired: stats.repaired,
+    inventory: inventory.map(i => ({ name: cleanName(i.defId), defId: i.defId, qty: i.qty, value: (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty })),
+    trades: tradeLog.slice(-50).reverse().map(r => ({ t: r.t, name: cleanName(r.defId), qty: r.qty, method: r.method, price: r.price, total: r.total })),
+    settings: {
+      schedule: scheduleActive ? config.scheduleRaw : 'off',
+      jitter: config.scheduleJitterPct,
+      reportMin: config.reportIntervalMin,
+      watchdogMin: config.watchdogStuckMin,
+      profitOnly: config.notifyProfitOnly,
+      dailyCap: DAILY_EARN_CAP,
+    },
   };
 }
 
@@ -1423,6 +1435,24 @@ setInterval(() => {
   log('\n' + buildStatusText().replace(/<[^>]+>/g, '') + '\n');
   notify(buildStatusText());
 }, Math.max(1, config.reportIntervalMin) * 60000);
+
+// ============ SALES DIGEST (near-real-time, batched ~2 min) ============
+setInterval(() => {
+  if (!pendingSales.length) return;
+  const count = pendingSales.reduce((s, r) => s + r.qty, 0);
+  const sum = pendingSales.reduce((s, r) => s + r.total, 0);
+  const lines = {};
+  for (const r of pendingSales) {
+    const k = cleanName(r.defId);
+    if (!lines[k]) lines[k] = { qty: 0, total: 0 };
+    lines[k].qty += r.qty; lines[k].total += r.total;
+  }
+  const body = Object.entries(lines).sort((a,b)=>b[1].total-a[1].total).slice(0,12)
+    .map(([k, v]) => `${k.padEnd(16).slice(0,16)} x${String(v.qty).padStart(3)}  +${fmt(v.total)}`).join('\n');
+  pendingSales = [];
+  const p = getProfitSummary();
+  notify(`🛒 <b>Terjual</b> ${count} item · +${fmt(sum)} OTWN\n<pre>${body}</pre>📍 ${currentActivity} · 💰 Total: ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h`);
+}, 120000);
 
 // ============ AUTOPILOT WATCHDOG ============
 // Detects "stuck" states the in-socket recovery misses and self-heals.
