@@ -59,7 +59,7 @@ log('FULL FEATURED: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Se
 // ============ CONSTANTS ============
 const WALK_SPEED = 0.4;
 const MAX_WALK_STEPS = 5000;
-const DAILY_EARN_CAP = 5000;
+let DAILY_EARN_CAP = 5000;  // fallback only; real per-account cap comes from server via player:state → dailyEarnCap
 const CARRY_CAP = 56;
 const MARKET_INTERVAL = 3500;
 const LOW_DURABILITY = 30;
@@ -192,6 +192,8 @@ let stats = {
   holdCount:0,holdValue:0,
 };
 let balance=0,level=1,stamina=100,hp=100,dailyEarned=0,maxHp=100;
+let lockedBalance=0,withdrawableBalance=0,prevBalance=null;
+const BALANCE_DROP_ALERT=20;   // report any spendable-balance drop >= this to Telegram
 let inventory=[],inventoryReady=false,connected=false;
 let pos={x:0,z:0},zone='unknown',fishingActive=false;
 let myActiveListings=[];
@@ -419,6 +421,7 @@ function tryCraft(sock) {
       sock.emit('inventory:craft', { recipeId });
       stats.crafted++;
       log(`🔨 Crafting ${recipeId} (fee: ${recipe.fee} OTWN)`);
+      notify(`🔨 <b>Craft</b> ${recipeId}\n💸 Fee: ${recipe.fee} OTWN`);
       return true;
     }
   }
@@ -446,6 +449,7 @@ function tryClinicHeal(sock) {
   if(zone === 'clinic' && hp < HEAL_HP && balance >= 10) {
     sock.emit('shop:clinicHeal');
     stats.clinicHeals++;
+    notify(`🏥 <b>Clinic heal</b> @HP ${hp} · ~10 OTWN`);
     log(`🏥 Clinic heal at HP:${hp}`);
     return true;
   }
@@ -457,8 +461,10 @@ function tryBuyFood(sock) {
   if(balance >= 50 && zone === 'food_row') {
     const foodCount = inventory.filter(i => FOOD_ITEMS.has(i.defId)).reduce((s,i) => s + i.qty, 0);
     if(foodCount < 5) {
-      sock.emit('shop:foodBuy', { defId: 'food_ember_skewer', qty: Math.min(5, Math.floor(balance / 10)) });
+      const fqty = Math.min(5, Math.floor(balance / 10));
+      sock.emit('shop:foodBuy', { defId: 'food_ember_skewer', qty: fqty });
       stats.itemsBought++;
+      notify(`🛒 <b>Beli food</b> food_ember_skewer x${fqty} · ~${fqty*10} OTWN`);
       log(`🛒 Buying food from shop`);
       return true;
     }
@@ -556,6 +562,7 @@ function vehicleBuy(sock, defId) {
     sock.emit('vehicle:buy', { defId });
     stats.vehiclesBought++;
     log(`🚗 Buying vehicle ${defId}`);
+    notify(`🚗 <b>Beli kendaraan</b> ${defId} · ≥500 OTWN`);
   }
 }
 
@@ -819,8 +826,8 @@ function freshSell(sock, cb) {
           for(const b of blockedQS) log(`  ⏸️ ${b.defId} x${b.qty} — HOLD`);
         }
         if(safeQS.length > 0) {
-          log(`💰 sellAll ${safeQS.length} safe QS items...`);
-          sock.emit('marketplace:sellAll');
+          const n = quickSellSafe(sock, safeQS);
+          log(`💰 QuickSell ${n} safe stacks (targeted — valuables protected)`);
         }
       }
       setTimeout(() => {
@@ -839,11 +846,25 @@ function freshSell(sock, cb) {
   if(toMarket.length > 0) { log(`📋 Listing ${toMarket.length} items...`); listNext(0); }
   else if(toQuickSell.length > 0) {
     const safeQS = toQuickSell.filter(i => SAFE_QUICKSELL.has(i.defId));
-    if(safeQS.length > 0) { log(`💰 sellAll ${safeQS.length} safe items...`); sock.emit('marketplace:sellAll'); }
+    if(safeQS.length > 0) { const n = quickSellSafe(sock, safeQS); log(`💰 QuickSell ${n} safe stacks (targeted)`); }
     setTimeout(() => { log(`💰 Done: QS +${stats.earnedQuick}`); cb(); }, 3000);
   }
   else if(toHold.length > 0) { log(`⏸️ All ${toHold.length} stacks on HOLD`); cb(); }
   else { log('💰 Nothing sellable'); cb(); }
+}
+
+// Targeted terminal-sell of ONLY safe cheap mats, per item instance.
+// NEVER use marketplace:sellAll — the server applies it to the WHOLE inventory
+// (sells everything except gear/tools/vehicles at terminal price), which dumps
+// valuable fish/cores (e.g. Sun Carp, Resonance Core) for a few OTWN.
+function quickSellSafe(sock, items) {
+  let n = 0;
+  for(const it of items) {
+    if(!SAFE_QUICKSELL.has(it.defId) || !it.instanceId) continue;
+    sock.emit('marketplace:quickSell', { instanceId: it.instanceId, qty: it.qty || 1 });
+    n++;
+  }
+  return n;
 }
 
 // ============ ACTIONS (v23: ENHANCED) ============
@@ -1089,13 +1110,31 @@ async function startBot() {
   socket.on('player:correction', (d) => { if(d.pos) { pos.x = d.pos.x; pos.z = d.pos.z; } });
   socket.on('player:state', (d) => {
     if(d.zone) zone = d.zone;
-    if(d.gameBalance !== undefined) balance = d.gameBalance;
+    if(d.lockedBalance !== undefined) lockedBalance = d.lockedBalance;
+    if(d.withdrawableBalance !== undefined) withdrawableBalance = d.withdrawableBalance;
+    if(d.gameBalance !== undefined) {
+      if(prevBalance !== null && d.gameBalance < prevBalance) {
+        const drop = +(prevBalance - d.gameBalance).toFixed(2);
+        if(drop >= BALANCE_DROP_ALERT) {
+          // If locked went up by ~the same amount, the money is escrowed in
+          // market listings (recoverable), not actually spent.
+          const lockedHint = lockedBalance > 0 ? `\n🔒 Locked (listing/escrow): <b>${lockedBalance}</b> — kemungkinan dana ke-hold di listing, bukan hilang` : '';
+          notify(`📉 <b>Saldo turun ${drop} OTWN</b>\n💰 Spendable: <b>${d.gameBalance.toFixed(0)}</b> (dari ${prevBalance.toFixed(0)})${lockedHint}\n🏦 Withdrawable: ${withdrawableBalance}`);
+        }
+      }
+      prevBalance = d.gameBalance;
+      balance = d.gameBalance;
+    }
     if(d.level !== undefined) {
       if(level && d.level > level) notifySys(`⬆️ <b>Level up!</b> Now level ${d.level}`);
       level = d.level;
     }
     if(d.stamina !== undefined) stamina = d.stamina;
     if(d.dailyEarnedOtwn !== undefined) dailyEarned = d.dailyEarnedOtwn;
+    if(d.dailyEarnCap !== undefined && d.dailyEarnCap !== DAILY_EARN_CAP) {
+      DAILY_EARN_CAP = d.dailyEarnCap;
+      log(`📊 Server daily earn cap: ${DAILY_EARN_CAP} OTWN`);
+    }
     if(d.hp !== undefined) hp = d.hp;
     if(d.maxHp !== undefined) maxHp = d.maxHp;
     // auto-detect our player id (used by flip/listing logic)
@@ -1516,6 +1555,40 @@ setInterval(() => {
   notify(buildStatusText());
 }, Math.max(1, config.reportIntervalMin) * 60000);
 
+// ============ DAILY REPORT (once / 24h, or via /daily) ============
+let dailyBaseline = null;
+function snapDailyBaseline() {
+  const p = getProfitSummary();
+  dailyBaseline = {
+    t: Date.now(), balance, totalEarned: p.totalEarned, itemsSold: p.itemsSold,
+    buySpent: buySpentToday, mined: stats.mined, fished: stats.fished, kills: stats.kills,
+  };
+}
+function buildDailyReport() {
+  const p = getProfitSummary();
+  const b = dailyBaseline || { t: stats.startTime, balance, totalEarned: 0, itemsSold: 0, buySpent: 0, mined: 0, fished: 0, kills: 0 };
+  const hrs = Math.max(0.1, (Date.now() - b.t) / 3600000);
+  const earned = p.totalEarned - b.totalEarned;
+  const spent = buySpentToday - b.buySpent;            // flip/powerup buys (other fees are tiny)
+  const netBal = Math.round(balance - b.balance);
+  return [
+    `📅 <b>DAILY REPORT</b> · ~${hrs.toFixed(1)}h`,
+    '<pre>' +
+      `Earned       +${fmt(Math.round(earned))} OTWN\n` +
+      `Buy spent    -${fmt(Math.round(spent))} OTWN\n` +
+      `Net balance  ${netBal >= 0 ? '+' : ''}${fmt(netBal)} OTWN\n` +
+      `Daily cap    ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}\n` +
+      `Balance now  ${fmt(Math.round(balance))}\n` +
+      `Locked       ${fmt(lockedBalance)}\n` +
+      `Bank         ${fmt(stats.bankBalance)}\n` +
+      `Items sold   ${fmt(p.itemsSold - b.itemsSold)}\n` +
+      `⛏ ${fmt(stats.mined - b.mined)}  🎣 ${fmt(stats.fished - b.fished)}  ⚔ ${fmt(stats.kills - b.kills)}` +
+    '</pre>',
+  ].join('\n');
+}
+snapDailyBaseline();
+setInterval(() => { notify(buildDailyReport()); snapDailyBaseline(); }, 24 * 3600000);
+
 // ============ SALES DIGEST (near-real-time, batched ~2 min) ============
 setInterval(() => {
   if (!pendingSales.length) return;
@@ -1566,7 +1639,8 @@ tg.on('help', () => notify([
   '/stop — bot OFF (lepas sesi, buat main manual)',
   '/status — ringkasan stats live',
   '/dashboard — link panel web',
-  '/balance — saldo + bank',
+  '/balance — saldo + locked + bank',
+  '/daily — ringkasan harian (earned/spent/net)',
   '/log [n] — log terakhir (default 15)',
   '/pause — jeda farming (tetap connect)',
   '/resume — lanjut farming',
@@ -1611,7 +1685,8 @@ tg.on('dashboard', async () => {
 });
 tg.on('status', () => notify(buildStatusText()));
 tg.on('stats', () => notify(buildStatusText()));
-tg.on('balance', () => notify(`💰 Balance: <b>${balance.toFixed(2)}</b> OTWN\n🏦 Bank withdrawable: ${stats.bankBalance}\n📅 Daily earned: ${dailyEarned}/${DAILY_EARN_CAP}`));
+tg.on('balance', () => notify(`💰 Balance: <b>${balance.toFixed(2)}</b> OTWN\n🔒 Locked: ${lockedBalance}\n🏦 Bank withdrawable: ${stats.bankBalance}\n📅 Daily earned: ${dailyEarned}/${DAILY_EARN_CAP}`));
+tg.on('daily', () => notify(buildDailyReport()));
 tg.on('log', (args) => {
   const n = Math.min(50, Math.max(1, parseInt(args[0] || '15', 10) || 15));
   const lines = LOG_RING.slice(-n).join('\n') || '(no logs yet)';
