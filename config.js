@@ -59,6 +59,15 @@ const config = {
   gameHost: process.env.GAME_HOST || 'owntown.fun',
   reportIntervalMin: parseInt(process.env.REPORT_INTERVAL_MIN || '30', 10),
   notifyProfitOnly: (process.env.NOTIFY_PROFIT_ONLY || 'true').toLowerCase() === 'true',
+
+  // Anti-detection schedule (human-like online/offline pattern)
+  scheduleEnabled: (process.env.SCHEDULE_ENABLED || 'true').toLowerCase() === 'true',
+  scheduleRaw: process.env.SCHEDULE || 'on:18,off:2,on:1,off:3',
+  scheduleJitterPct: parseInt(process.env.SCHEDULE_JITTER_PCT || '12', 10), // ±% randomization per phase
+
+  // Dashboard login
+  dashUser: process.env.DASH_USER || 'admin',
+  dashPass: process.env.DASH_PASS || '',
   watchdogStuckMin: parseInt(process.env.WATCHDOG_STUCK_MIN || '5', 10),
   logPath: process.env.LOG_PATH || '/tmp/owntown_v23.log',
   tokenPath: process.env.TOKEN_PATH || '/tmp/owntown_token.txt',

@@ -1405,13 +1405,18 @@ function getSnapshot() {
     mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
     crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
     market, log: LOG_RING.slice(-40), hourly: getHourly(12),
+    schedule: schedStatus(), errorsStreak: stats.consecutiveErrors,
+    memMB: Math.round(process.memoryUsage().rss / 1048576),
+    propertyEarnings: stats.propertyEarnings,
   };
 }
 
-// generate + persist a dashboard access key if none set
+// generate + persist a dashboard access key + login password if none set
 let DASH_KEY = config.dashboardKey;
 if (!DASH_KEY) { DASH_KEY = crypto.randomBytes(8).toString('hex'); persistEnv('DASHBOARD_KEY', DASH_KEY); }
-startDashboard({ port: config.dashboardPort, key: DASH_KEY, getSnapshot, logger: log });
+let DASH_PASS = config.dashPass;
+if (!DASH_PASS) { DASH_PASS = crypto.randomBytes(6).toString('base64url'); persistEnv('DASH_PASS', DASH_PASS); log(`🖥️ Dashboard login → user: ${config.dashUser}  pass: ${DASH_PASS}`); }
+startDashboard({ port: config.dashboardPort, key: DASH_KEY, user: config.dashUser, pass: DASH_PASS, getSnapshot, logger: log });
 
 // ============ STATUS REPORT (configurable interval) ============
 setInterval(() => {
@@ -1455,6 +1460,12 @@ tg.on('help', () => notify([
   '/log [n] — log terakhir (default 15)',
   '/pause — jeda farming (tetap connect)',
   '/resume — lanjut farming',
+  '/inventory — isi tas',
+  '/income — rincian pendapatan',
+  '/health — kesehatan sistem',
+  '/errors — error terakhir',
+  '/schedule — jadwal anti-detect',
+  '/ping — cek bot hidup',
   '/restart — restart proses',
   '/update — pull update code + restart',
   '/reauth — login ulang ke game',
@@ -1507,6 +1518,58 @@ tg.on('reauth', () => {
   try { if (activeSocket) activeSocket.disconnect(); } catch {}
   setTimeout(startBot, 1500);
 });
+tg.on('ping', () => notify(`🏓 <b>pong</b> · ${connected ? '🟢 online' : '🔴 offline'} · ⏱ ${fmtUptime(Date.now() - stats.startTime)}`));
+tg.on('logs', (a) => tg.handlers['log'](a));
+tg.on('schedule', () => {
+  const list = schedulePhases.map((p, i) => `${i === schedIdx ? '▶️' : '  '} ${p.state.toUpperCase()} ${p.hours}j`).join('\n');
+  notify(`🗓️ <b>Anti-detect schedule</b>\n${scheduleActive ? schedStatus() : 'disabled'}\n<pre>${list || 'none'}</pre>`);
+});
+tg.on('health', () => {
+  const mem = process.memoryUsage();
+  const idleM = Math.round((Date.now() - lastActivity) / 60000);
+  notify([
+    `🩺 <b>Health</b>`,
+    '<pre>' +
+    `Game       ${connected ? 'OK 🟢' : 'DOWN 🔴'}\n` +
+    `Telegram   ${tg.enabled ? 'OK 🟢' : 'DOWN 🔴'}\n` +
+    `Token      ${token && !isTokenExpired(token) ? 'valid' : 'stale'}\n` +
+    `Idle       ${idleM}m (watchdog @${config.watchdogStuckMin}m)\n` +
+    `Errors     ${stats.errors} (streak ${stats.consecutiveErrors})\n` +
+    `Schedule   ${schedStatus()}\n` +
+    `Memory     ${(mem.rss/1048576).toFixed(0)} MB\n` +
+    `Uptime     ${fmtUptime(Date.now() - stats.startTime)}` +
+    '</pre>',
+  ].join('\n'));
+});
+tg.on('errors', () => {
+  const errs = LOG_RING.filter(l => /ERR|❌|💥|⚠️|fail/i.test(l)).slice(-12);
+  notify('⚠️ <b>Recent errors</b>\n<pre>' + (errs.join('\n').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) || 'none 🎉') + '</pre>');
+});
+tg.on('inventory', () => {
+  if (!inventory.length) { notify('🎒 Inventory kosong.'); return; }
+  const rows = inventory.slice(0, 30).map(i => {
+    const val = (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty;
+    return `${(i.defId.replace(/^(mat_|fish_|wpn_|tool_|cos_|food_|med_|kit_|pet_|permit_)/, '')).padEnd(16).slice(0,16)} x${String(i.qty).padStart(3)}  ~${val}`;
+  }).join('\n');
+  notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP})\n<pre>${rows}</pre>`);
+});
+tg.on('income', () => {
+  const p = getProfitSummary();
+  const hrs = getHourly(6).map(h => `${h.h}:00  +${fmt(h.v)}`).join('\n');
+  notify([
+    `💵 <b>Income</b>`,
+    '<pre>' +
+    `Total      ${fmt(p.totalEarned)} OTWN\n` +
+    `Rate       ${fmt(p.rate)} /h\n` +
+    `QuickSell  +${fmt(stats.earnedQuick)}\n` +
+    `Market     +${fmt(stats.earnedMarket)}\n` +
+    `PvP        +${fmt(stats.pvpEarnings)}\n` +
+    `Property   +${fmt(stats.propertyEarnings)}\n` +
+    `Sold       ${fmt(p.itemsSold)} items` +
+    '</pre>',
+    `<i>Per jam (6h):</i>\n<pre>${hrs}</pre>`,
+  ].join('\n'));
+});
 tg.on('restart', () => { notify('♻️ Restarting process...'); setTimeout(() => process.exit(0), 800); });
 tg.on('update', () => {
   notify('⬇️ Pulling latest code from git...');
@@ -1525,6 +1588,54 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason) => {
   log('💥 unhandledRejection: ' + (reason && reason.stack || reason));
 });
+
+// ============ ANTI-DETECTION SCHEDULE ============
+// Human-like online/offline pattern, e.g. SCHEDULE="on:18,off:2,on:1,off:3"
+let schedulePhases = [];
+let schedIdx = 0;
+let schedPhaseEnd = 0;
+const scheduleActive = config.scheduleEnabled;
+function parseSchedule(raw) {
+  return raw.split(',').map(s => {
+    const [st, h] = s.split(':');
+    return { state: (st || '').trim().toLowerCase() === 'off' ? 'off' : 'on', hours: parseFloat(h) || 1 };
+  }).filter(p => p.hours > 0);
+}
+function jitterMs(hours) {
+  const j = config.scheduleJitterPct / 100;
+  return Math.round(hours * 3600000 * (1 + (Math.random() * 2 - 1) * j));
+}
+function schedUntilStr() { return new Date(schedPhaseEnd).toISOString().slice(11, 16); }
+function applyPhase(announce) {
+  const p = schedulePhases[schedIdx];
+  if (!p) return;
+  schedPhaseEnd = Date.now() + jitterMs(p.hours);
+  if (p.state === 'on') {
+    log(`🗓️ Schedule ON (~${p.hours}h → ~${schedUntilStr()} UTC)`);
+    if (stopped) { stopped = false; startBot(); }
+  } else {
+    log(`🗓️ Schedule OFF (~${p.hours}h → ~${schedUntilStr()} UTC)`);
+    stopped = true;
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    try { if (activeSocket) activeSocket.disconnect(); } catch {}
+    connected = false;
+  }
+  if (announce) notifySys(`🗓️ <b>Jadwal: ${p.state.toUpperCase()}</b> ~${p.hours}j (s/d ~${schedUntilStr()} UTC)`);
+}
+function schedStatus() {
+  if (!scheduleActive || !schedulePhases.length) return 'disabled';
+  const p = schedulePhases[schedIdx];
+  const mins = Math.max(0, Math.round((schedPhaseEnd - Date.now()) / 60000));
+  return `${p.state.toUpperCase()} · sisa ~${Math.floor(mins/60)}h ${mins%60}m`;
+}
+if (scheduleActive) {
+  schedulePhases = parseSchedule(config.scheduleRaw);
+  if (schedulePhases.length) applyPhase(false);
+}
+setInterval(() => {
+  if (!scheduleActive || !schedulePhases.length) return;
+  if (Date.now() >= schedPhaseEnd) { schedIdx = (schedIdx + 1) % schedulePhases.length; applyPhase(true); }
+}, 30000);
 
 // ============ BOOT ============
 log('🚀 Starting v23 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram + Autopilot...');

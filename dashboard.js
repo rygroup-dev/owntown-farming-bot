@@ -2,41 +2,94 @@
 // Serves a live, auto-refreshing dashboard + JSON data endpoint.
 // Protected by a simple access key (?key=...).
 const http = require('http');
+const crypto = require('crypto');
 
-function startDashboard({ port, key, getSnapshot, logger }) {
+function startDashboard({ port, key, user, pass, getSnapshot, logger }) {
   const log = logger || (() => {});
+  // session token = HMAC(key, user:pass); changing creds invalidates old cookies
+  const authToken = crypto.createHmac('sha256', key).update(`${user}:${pass}`).digest('hex');
+  const COOKIE = 'ot_auth';
 
-  const server = http.createServer((req, res) => {
+  function parseCookies(req) {
+    const out = {};
+    (req.headers.cookie || '').split(';').forEach(c => { const i = c.indexOf('='); if (i > -1) out[c.slice(0, i).trim()] = c.slice(i + 1).trim(); });
+    return out;
+  }
+  function authed(req, url) {
+    if (parseCookies(req)[COOKIE] === authToken) return true;       // logged-in session
+    if (key && url.searchParams.get('key') === key) return true;     // direct key (scripts)
+    return false;
+  }
+  function readBody(req) {
+    return new Promise(resolve => { let b = ''; req.on('data', c => { b += c; if (b.length > 4096) req.destroy(); }); req.on('end', () => resolve(b)); });
+  }
+
+  const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
-    // JSON data endpoint (used by the page; also handy for scripts)
-    if (url.pathname === '/data') {
-      if (key && url.searchParams.get('key') !== key) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end('{"error":"forbidden"}');
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify(getSnapshot()));
-      return;
-    }
-    // HTML page
-    if (url.pathname === '/' || url.pathname === '/dashboard') {
-      if (key && url.searchParams.get('key') !== key) {
-        res.writeHead(403, { 'Content-Type': 'text/html' });
-        res.end('<h2>403 — add ?key=YOUR_KEY to the URL</h2>');
-        return;
-      }
+
+    // --- LOGIN ---
+    if (url.pathname === '/login' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(PAGE.replace('__KEY__', key || ''));
-      return;
+      res.end(LOGIN_PAGE.replace('__ERR__', '')); return;
+    }
+    if (url.pathname === '/login' && req.method === 'POST') {
+      const body = await readBody(req);
+      const params = new URLSearchParams(body);
+      if (params.get('user') === user && params.get('pass') === pass) {
+        res.writeHead(302, { 'Set-Cookie': `${COOKIE}=${authToken}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`, 'Location': '/' });
+        res.end(); log('🖥️ Dashboard login OK'); return;
+      }
+      log('🖥️ Dashboard login FAILED');
+      res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(LOGIN_PAGE.replace('__ERR__', 'Username atau password salah')); return;
+    }
+    if (url.pathname === '/logout') {
+      res.writeHead(302, { 'Set-Cookie': `${COOKIE}=; Path=/; Max-Age=0`, 'Location': '/login' }); res.end(); return;
+    }
+
+    // --- DATA (JSON) ---
+    if (url.pathname === '/data') {
+      if (!authed(req, url)) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end('{"error":"forbidden"}'); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(getSnapshot())); return;
+    }
+
+    // --- DASHBOARD PAGE ---
+    if (url.pathname === '/' || url.pathname === '/dashboard') {
+      if (!authed(req, url)) { res.writeHead(302, { 'Location': '/login' }); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(PAGE.replace('__KEY__', '')); return; // page uses cookie; no key in URL
     }
     res.writeHead(404); res.end('not found');
   });
 
   server.on('error', (e) => log('🖥️ Dashboard error: ' + e.message));
-  server.listen(port, '0.0.0.0', () => log(`🖥️ Dashboard on http://0.0.0.0:${port}/?key=${key}`));
+  server.listen(port, '0.0.0.0', () => log(`🖥️ Dashboard on :${port} (login required)`));
   return server;
 }
+
+const LOGIN_PAGE = `<!doctype html><html lang="id"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Owntown Bot — Login</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1200px 600px at 50% -10%,#16233f,#0b0f17);color:#e6edf6;font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+.box{background:#141b2b;border:1px solid #243049;border-radius:18px;padding:30px;width:330px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+h1{margin:0 0 4px;font-size:20px}.sub{color:#8aa0c0;font-size:13px;margin-bottom:20px}
+label{display:block;font-size:12px;color:#8aa0c0;margin:12px 0 5px}
+input{width:100%;padding:11px 13px;border-radius:10px;border:1px solid #243049;background:#0a0e16;color:#e6edf6;font-size:14px}
+input:focus{outline:none;border-color:#3ddc84}
+button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:10px;background:linear-gradient(180deg,#3ddc84,#1f9e5a);color:#06210f;font-weight:700;font-size:15px;cursor:pointer}
+.err{color:#ff5c5c;font-size:13px;margin-top:12px;min-height:18px;text-align:center}
+.logo{font-size:34px;text-align:center;margin-bottom:6px}
+</style></head><body>
+<form class="box" method="POST" action="/login">
+ <div class="logo">🏭</div>
+ <h1>Owntown Bot</h1><div class="sub">Monitoring dashboard — login dulu ya</div>
+ <label>Username</label><input name="user" autocomplete="username" autofocus>
+ <label>Password</label><input name="pass" type="password" autocomplete="current-password">
+ <button type="submit">Masuk</button>
+ <div class="err">__ERR__</div>
+</form></body></html>`;
 
 const PAGE = `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -57,7 +110,7 @@ header h1{font-size:16px;margin:0}.dot{width:10px;height:10px;border-radius:50%;
 pre{background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:280px;overflow:auto;font-size:11.5px;color:#bcd}
 .foot{color:var(--mut);font-size:12px;text-align:center;padding:14px}
 </style></head><body>
-<header><span class="dot" id="dot"></span><h1>🏭 Owntown Bot</h1><span class="pill" id="state">…</span><span class="pill" id="now" style="color:#5cffa0;border-color:#1f9e5a">…</span><span class="pill" id="uptime"></span><span class="pill" id="upd"></span></header>
+<header><span class="dot" id="dot"></span><h1>🏭 Owntown Bot</h1><span class="pill" id="state">…</span><span class="pill" id="now" style="color:#5cffa0;border-color:#1f9e5a">…</span><span class="pill" id="uptime"></span><span class="pill" id="upd"></span><a href="/logout" class="pill" style="margin-left:auto;text-decoration:none;color:#ff8a8a;border-color:#5a2a2a">logout</a></header>
 <div class="wrap"><div class="grid">
  <div class="card"><h2>💰 Wallet & Balance</h2>
    <div class="row"><span>In-game</span><b class="big grn" id="bal">—</b></div>
