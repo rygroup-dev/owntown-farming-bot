@@ -1859,7 +1859,7 @@ tg.on('selfix', () => {
   notify([
     '🩺 <b>Self-Fix</b>',
     '<pre>',
-    `Blacklisted zones   ${ZONE_BLACKLIST.join(', ') || 'none'}`,
+    `Blacklisted zones   ${esc(ZONE_BLACKLIST.join(', ') || 'none')}`,
     `Reconnect backoff   ${RECONNECT_BACKOFF_MS}ms`,
     `Pending patch       ${pend}`,
     `Backups kept        ${backups}`,
