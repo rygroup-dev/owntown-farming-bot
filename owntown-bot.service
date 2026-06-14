@@ -1,0 +1,20 @@
+[Unit]
+Description=Owntown Farming Bot (autopilot + Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/owntown-farming-bot
+ExecStart=/usr/bin/node /root/owntown-farming-bot/bot.js
+Restart=always
+RestartSec=5
+# stop hammering if it crashes in a tight loop, but never give up permanently
+StartLimitIntervalSec=0
+# bot keeps its own file at /tmp/owntown_v23.log; service stream goes to journald
+StandardOutput=journal
+StandardError=journal
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

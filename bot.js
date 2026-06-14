@@ -2,20 +2,46 @@ const io = require('socket.io-client');
 const fs = require('fs');
 const https = require('https');
 const nacl = require('tweetnacl');
-const bs58 = require('bs58').default;
+const bs58 = require('bs58').default || require('bs58');
+const { config, persistEnv } = require('./config');
+const { Telegram } = require('./telegram');
 
-// ============ CONFIG ============
-const TOKEN_PATH = '/tmp/owntown_token.txt';
-const WALLET_ADDR = '5zkKFMR4pmde1pjT2zzQfLuPaHoFgoch6uMcD38Xe2rV';
-const WALLET_FILE = '/root/.hermes/owntown-attack-wallet.json';
-const LOG = '/tmp/owntown_v23.log';
-fs.writeFileSync(LOG, '');
+// ============ CONFIG (env-driven, see .env) ============
+const TOKEN_PATH = config.tokenPath;
+const GAME_HOST = config.gameHost;
+let WALLET_ADDR = config.walletAddress;
+const WALLET_FILE = config.walletFile;
+const LOG = config.logPath;
+let MY_PLAYER_ID = config.playerId; // auto-detected at runtime if blank
+try { fs.writeFileSync(LOG, ''); } catch (e) { /* log dir may be missing; fall back to stdout */ }
+
+// circular ring buffer of recent log lines (for /log command)
+const LOG_RING = [];
+const LOG_RING_MAX = 200;
 
 function log(m) {
   const l = new Date().toISOString().slice(11,19) + ' | ' + m;
-  fs.appendFileSync(LOG, l + '\n');
+  try { fs.appendFileSync(LOG, l + '\n'); } catch (e) { /* ignore fs errors */ }
   process.stdout.write(l + '\n');
+  LOG_RING.push(l);
+  if (LOG_RING.length > LOG_RING_MAX) LOG_RING.shift();
 }
+
+// ============ TELEGRAM ============
+const tg = new Telegram({
+  token: config.telegramToken,
+  chatId: config.telegramChatId,
+  logger: log,
+  onChatIdLearned: (id) => persistEnv('TELEGRAM_CHAT_ID', id),
+});
+function notify(m) { tg.send(m); }
+
+// ============ AUTOPILOT STATE ============
+let paused = false;
+let lastActivity = Date.now();        // updated on any meaningful game result
+let activeSocket = null;              // current live socket (for watchdog/commands)
+let lastCycleStart = Date.now();
+function touchActivity() { lastActivity = Date.now(); }
 
 log('=== OWNTOWN PROFIT FARMER v23.0 ===');
 log('FULL FEATURED: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Sell');
@@ -27,7 +53,6 @@ const DAILY_EARN_CAP = 5000;
 const CARRY_CAP = 56;
 const MARKET_INTERVAL = 3500;
 const LOW_DURABILITY = 30;
-const MY_PLAYER_ID = '39ebfc6a-5d20-4ef7-931b-83501d40adbf';
 const FISHING_TIMEOUT = 120000;
 const UNDERCUT_PCT = 0.08;
 const LOW_STAMINA = 30;
@@ -177,7 +202,7 @@ function apiRequest(method, path, body, token) {
     if (token) headers['Authorization'] = `Bearer ${token}`;
     if (data) headers['Content-Length'] = Buffer.byteLength(data);
     const req = https.request({
-      hostname: 'owntown.fun', path, method, headers
+      hostname: GAME_HOST, path, method, headers, timeout: 20000
     }, (res) => {
       let d = '';
       res.on('data', c => d += c);
@@ -187,6 +212,7 @@ function apiRequest(method, path, body, token) {
       });
     });
     req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('request timeout')); });
     if (data) req.write(data);
     req.end();
   });
@@ -196,16 +222,41 @@ async function apiGet(path, token) { return apiRequest('GET', path, null, token)
 async function apiPost(path, body, token) { return apiRequest('POST', path, body, token); }
 
 // ============ AUTH ============
+function loadSecretKey() {
+  // Priority: WALLET_PRIVATE_KEY env (base58) -> WALLET_FILE json {private_key}
+  let b58 = config.walletPrivateKey;
+  if (!b58 && WALLET_FILE) {
+    try { b58 = JSON.parse(fs.readFileSync(WALLET_FILE)).private_key; } catch (e) { /* ignore */ }
+  }
+  if (!b58) throw new Error('No wallet configured — set WALLET_PRIVATE_KEY (base58) in .env');
+  const secretKey = bs58.decode(b58);
+  if (secretKey.length === 32) {
+    // 32-byte seed -> expand to full 64-byte nacl keypair
+    return nacl.sign.keyPair.fromSeed(secretKey).secretKey;
+  }
+  if (secretKey.length !== 64) throw new Error(`Bad private key length ${secretKey.length} (expect 32 or 64 bytes base58)`);
+  return secretKey;
+}
+
 async function authenticate() {
-  const wallet = JSON.parse(fs.readFileSync(WALLET_FILE));
-  const secretKey = bs58.decode(wallet.private_key);
+  const secretKey = loadSecretKey();
+  // derive address from key if not provided
+  if (!WALLET_ADDR) {
+    WALLET_ADDR = bs58.encode(secretKey.slice(32));
+    log(`🔑 Derived wallet address: ${WALLET_ADDR}`);
+  }
   const challenge = await apiPost('/api/auth/challenge', { wallet: WALLET_ADDR });
+  // Guard against flaky/502 challenge responses — don't sign garbage
+  if (challenge.status !== 200 || !challenge.data || typeof challenge.data !== 'object') {
+    throw new Error(`Challenge failed (status ${challenge.status}): ${typeof challenge.data === 'string' ? challenge.data.slice(0,80) : JSON.stringify(challenge.data)}`);
+  }
   const nonce = challenge.data.nonce || challenge.data.challenge;
+  if (!nonce) throw new Error('Challenge returned no nonce: ' + JSON.stringify(challenge.data).slice(0,120));
   const message = challenge.data.message || ('owntown_auth:' + nonce);
   const sig = nacl.sign.detached(Buffer.from(message), secretKey);
   const result = await apiPost('/api/auth/verify', { wallet: WALLET_ADDR, nonce, signature: bs58.encode(sig) });
   if (!result.data.token) throw new Error('Auth failed: ' + JSON.stringify(result.data));
-  fs.writeFileSync(TOKEN_PATH, result.data.token);
+  try { fs.writeFileSync(TOKEN_PATH, result.data.token); } catch (e) { /* ignore */ }
   log('🔑 Authenticated! Token valid until ' + new Date(JSON.parse(Buffer.from(result.data.token.split('.')[1],'base64')).exp*1000).toISOString());
   return result.data.token;
 }
@@ -474,6 +525,7 @@ const FLIP_MAX_COST = 200;
 const FLIP_MIN_PROFIT = 50;
 
 function checkFlipOpportunities(sock, listings) {
+  if(!MY_PLAYER_ID) return false; // don't flip until we know our own id (avoid buying own listings)
   if(Date.now() - lastFlipTime < FLIP_COOLDOWN) return false;
   let bestFlip = null, bestProfit = 0;
   for(const l of listings) {
@@ -778,6 +830,12 @@ function doActions(sock, type) {
 // ============ CYCLE (v23: ADDS PVP + SHOP + BANK) ============
 function runNextCycle(sock) {
   if(!connected) return;
+  lastCycleStart = Date.now();
+  if(paused) {
+    // Idle while paused; re-check shortly. Watchdog won't fire because paused is excluded.
+    setTimeout(() => runNextCycle(sock), 5000);
+    return;
+  }
   if(stats.consecutiveErrors >= 10) {
     log(`⚠️ ${stats.consecutiveErrors} err — reconnect`);
     sock.disconnect();
@@ -889,28 +947,48 @@ function startAction(sock, type) {
 }
 
 // ============ MAIN BOT ============
+let fundingNotified = false;
 async function startBot() {
   inventoryReady = false;
   if(!token || isTokenExpired(token)) {
-    try { token = await authenticate(); } catch(e) {
+    try { token = await authenticate(); }
+    catch(e) {
       log('❌ Auth failed: ' + e.message);
+      // Auto-detect "needs funding": wallet must hold >= required OTWN to play
+      const m = e.message.match(/INSUFFICIENT_OTWN.*?"required":(\d+)/) || (e.message.includes('INSUFFICIENT_OTWN') ? [null, '5000'] : null);
+      if (m) {
+        if (!fundingNotified) {
+          fundingNotified = true;
+          notify(`⛽ <b>Wallet needs funding</b>\nHold at least <b>${m[1]} $OTWN</b> to enter Player Mode.\nWallet: <code>${WALLET_ADDR}</code>\nI'll keep checking every 5 min and auto-start once funded.`);
+        }
+        setTimeout(startBot, 300000); // slow 5-min retry while unfunded
+        return;
+      }
+      fundingNotified = false;
       setTimeout(startBot, 30000);
       return;
     }
+    fundingNotified = false; // auth succeeded -> reset for next time
   }
 
-  const socket = io('https://owntown.fun', { auth: { token }, transports: ['websocket'] });
+  const socket = io('https://' + GAME_HOST, { auth: { token }, transports: ['websocket'] });
 
   // === PLAYER STATE ===
   socket.on('player:correction', (d) => { if(d.pos) { pos.x = d.pos.x; pos.z = d.pos.z; } });
   socket.on('player:state', (d) => {
     if(d.zone) zone = d.zone;
     if(d.gameBalance !== undefined) balance = d.gameBalance;
-    if(d.level !== undefined) level = d.level;
+    if(d.level !== undefined) {
+      if(level && d.level > level) notify(`⬆️ <b>Level up!</b> Now level ${d.level}`);
+      level = d.level;
+    }
     if(d.stamina !== undefined) stamina = d.stamina;
     if(d.dailyEarnedOtwn !== undefined) dailyEarned = d.dailyEarnedOtwn;
     if(d.hp !== undefined) hp = d.hp;
     if(d.maxHp !== undefined) maxHp = d.maxHp;
+    // auto-detect our player id (used by flip/listing logic)
+    const pid = d.playerId || d.id || d.playerID;
+    if(pid && !MY_PLAYER_ID) { MY_PLAYER_ID = String(pid); log(`🆔 Detected player id: ${MY_PLAYER_ID}`); }
   });
 
   // === INVENTORY ===
@@ -937,6 +1015,7 @@ async function startBot() {
 
   // === MINING ===
   socket.on('mining:result', (d) => {
+    touchActivity();
     stats.mined++; stats.xp += d.xpGained || 0; stats.items += d.qty || 0; stats.consecutiveErrors = 0;
     if(d.fatigueMultiplier !== undefined) fatigueMultiplier = d.fatigueMultiplier;
     if(d.fatigueMultiplier < 0.95) stats.fatigueDrops++;
@@ -951,6 +1030,7 @@ async function startBot() {
   // === FISHING ===
   socket.on('fishing:cast', (d) => { fishingActive = true; log(`🎣 Wait ${Math.round(d.waitMs/1000)}s`); });
   socket.on('fishing:result', (d) => {
+    touchActivity();
     fishingActive = false; stats.fished++; stats.xp += d.xp || d.xpGained || 0; stats.items += d.qty || 1; stats.consecutiveErrors = 0;
     const sp = getSellDecision(d.defId || 'fish', d.qty || 1);
     log(`🎣 ${d.itemName||d.defId||'fish'} x${d.qty||1} +${d.xp||d.xpGained||0}XP → ${sp.action}${sp.price?'@'+sp.price:''}${sp.reason?' ('+sp.reason+')':''}`);
@@ -959,6 +1039,7 @@ async function startBot() {
 
   // === COMBAT ===
   socket.on('combat:result', (d) => {
+    touchActivity();
     stats.fought++; stats.xp += d.xpGained || 0; stats.consecutiveErrors = 0;
     if(d.playerHp !== undefined) hp = d.playerHp;
     if(d.counterDamage > 0) log(`⚔ HIT:${d.damage} HP:${d.monsterHp} MY_HP:${hp} COUNTER:${d.counterDamage}`);
@@ -981,6 +1062,7 @@ async function startBot() {
     if(d.phase === 'active' && !stats.worldBossActive) {
       stats.worldBossActive = true;
       log(`👹 WORLD BOSS ACTIVE! ${d.name || ''} HP:${d.hp}/${d.maxHp}`);
+      notify(`👹 <b>World Boss spawned!</b> ${d.name || ''} — auto-entering`);
       socket.emit('worldboss:enter');
     }
     if(d.phase === 'dead') {
@@ -1169,8 +1251,11 @@ async function startBot() {
   let disconnectTimer = null;
   socket.on('connect', () => {
     connected = true;
+    touchActivity();
     if(disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
     log('Connected!');
+    notify(`🟢 <b>Connected</b> to ${GAME_HOST}`);
+    activeSocket = socket;
     let started = false;
     socket.on('player:correction', function onCorr(d) {
       if(!started && d.pos) {
@@ -1196,6 +1281,7 @@ async function startBot() {
   socket.on('disconnect', () => {
     log('Disconnected!');
     connected = false;
+    notify(`🔴 <b>Disconnected</b> — auto-reconnect in 30s`);
     disconnectTimer = setTimeout(() => { log('⚠️ Reconnecting...'); startBot(); }, 30000);
   });
 
@@ -1219,34 +1305,107 @@ async function startBot() {
   }
 }
 
-// ============ STATUS REPORT (10 min) ============
-setInterval(() => {
+// ============ STATUS SUMMARY (shared by report + /status) ============
+function buildStatusText() {
   const p = getProfitSummary();
   const fishItems = inventory.filter(i => i.defId.startsWith('fish_'));
   const matItems = inventory.filter(i => i.defId.startsWith('mat_'));
   const fishValue = fishItems.reduce((s,i) => s + (PRICE_FLOOR[i.defId]||1) * i.qty, 0);
   const matValue = matItems.reduce((s,i) => s + (PRICE_FLOOR[i.defId]||1) * i.qty, 0);
+  const conn = connected ? '🟢 online' : '🔴 offline';
+  const state = paused ? '⏸️ PAUSED' : '▶️ farming';
+  return [
+    `📊 <b>OWNTOWN [${p.hours}h]</b> — ${conn} ${state}`,
+    `⛏${stats.mined} 🎣${stats.fished} ⚔${stats.kills} | Lv${level} XP${stats.xp}`,
+    `💰 QS:+${stats.earnedQuick} MKT:+${stats.earnedMarket} PvP:+${stats.pvpEarnings} <b>Total:${p.totalEarned}</b>`,
+    `💵 Rate: ${p.rate}/h | Sold: ${p.itemsSold} items`,
+    `💰 Bal:${balance.toFixed(2)} | Daily:${dailyEarned}/${DAILY_EARN_CAP} | 🏦 Bank:${stats.bankBalance}`,
+    `❤️ HP:${hp}/${maxHp} | STA:${stamina} | 📦 ${inventory.length}/${CARRY_CAP}`,
+    `🐟 Fish:${fishItems.length}(~${fishValue}) 🧱 Mats:${matItems.length}(~${matValue}) ⏸️ Held:${stats.holdCount}`,
+    `⚔️ PvP:${stats.pvpWins}w 🏠 Prop:+${stats.propertyEarnings} 👹 Boss:${stats.bossClaims} 🔨 Craft:${stats.crafted}`,
+    `🛒 Flip:${stats.itemsBought} 🔔 Notif:${stats.notifications} ⚠️ Err:${stats.errors}`,
+    `🔧 WrongZone:${stats.wrongZone} FishTO:${stats.fishingTimeouts} Zone:${zone}`,
+  ].join('\n');
+}
 
-  log(`\n📊 ══ [${p.hours}h] PROFIT REPORT v23 ══`);
-  log(`⛏${stats.mined} 🎣${stats.fished} ⚔${stats.kills} | Lv${level} XP${stats.xp}`);
-  log(`💰 QS:+${stats.earnedQuick} MKT:+${stats.earnedMarket} PvP:+${stats.pvpEarnings} Total:${p.totalEarned}`);
-  log(`💵 Rate: ${p.rate}/h | Sold: ${p.itemsSold} items`);
-  log(`📦 ${inventory.length}/${CARRY_CAP} stacks`);
-  log(`🐟 Fish: ${fishItems.length} (~${fishValue}) | 🧱 Mats: ${matItems.length} (~${matValue})`);
-  log(`⏸️ Held: ${stats.holdCount} (~${stats.holdValue})`);
-  log(`💰 Bal:${balance.toFixed(2)} | Daily:${dailyEarned}/${DAILY_EARN_CAP}`);
-  log(`❤️ HP:${hp}/${maxHp} | STA:${stamina}`);
-  log(`⚔️ PvP: ${stats.pvpFights}f ${stats.pvpWins}w ${stats.pvpClaims}c +${stats.pvpEarnings}`);
-  log(`🏠 Prop: ${stats.propertyBought}b ${stats.propertySold}s +${stats.propertyEarnings}`);
-  log(`🏦 Bank: bal:${stats.bankBalance} dep:${stats.bankDeposits} wd:${stats.bankWithdrawals}`);
-  log(`👹 Boss:${stats.bossClaims} | 🔨 Craft:${stats.crafted} | 🍖 Food:${stats.foodEaten} | 🏥 Heal:${stats.clinicHeals}`);
-  log(`🛒 Flip: ${stats.itemsFlipped} (+${stats.flipProfit}) | 🔔 Notif:${stats.notifications}`);
-  log(`🔧 Zone:${stats.wrongZone} FishTO:${stats.fishingTimeouts} Fatigue:${stats.fatigueDrops} Rests:${stats.restCount}`);
-  log(`📍 Node:${MINING_NODES[stats.currentNodeIdx%MINING_NODES.length].id} | Mon:${MONSTERS[stats.currentMonsterIdx%MONSTERS.length].id}`);
-  const priceLog = Object.entries(marketPrices).filter(([k])=>PRICE_FLOOR[k]).map(([k,v])=>{const t=getPriceTrend(k);const icon=t==='rising'?'📈':t==='falling'?'📉':'➡️';return `${k.replace('mat_','').replace('fish_','')}:${v}${icon}`;}).join(' ');
-  log(`📈 Market: ${priceLog}`);
-  log(`══════════════════\n`);
-}, 600000);
+// ============ STATUS REPORT (configurable interval) ============
+setInterval(() => {
+  log('\n' + buildStatusText().replace(/<\/?b>/g, '') + '\n');
+  notify(buildStatusText());
+}, Math.max(1, config.reportIntervalMin) * 60000);
 
-log('🚀 Starting v23 — Full Featured: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Sell...');
+// ============ AUTOPILOT WATCHDOG ============
+// Detects "stuck" states the in-socket recovery misses and self-heals.
+const WATCHDOG_STUCK_MS = Math.max(2, config.watchdogStuckMin) * 60000;
+setInterval(() => {
+  if (paused) return;
+  const idle = Date.now() - lastActivity;
+  // 1) Connected but no game activity for too long -> kick the cycle / reconnect
+  if (connected && idle > WATCHDOG_STUCK_MS) {
+    log(`🐶 WATCHDOG: no activity for ${Math.round(idle/60000)}m — recovering`);
+    notify(`🐶 <b>Watchdog</b>: stuck ${Math.round(idle/60000)}m, restarting cycle`);
+    touchActivity(); // reset so we don't loop instantly
+    if (activeSocket && activeSocket.connected) {
+      try { runNextCycle(activeSocket); } catch (e) { log('🐶 cycle restart failed: ' + e.message); }
+    } else {
+      try { if (activeSocket) activeSocket.disconnect(); } catch {}
+      setTimeout(startBot, 2000);
+    }
+  }
+  // 2) Fully disconnected for way too long -> hard reconnect
+  if (!connected && idle > WATCHDOG_STUCK_MS * 2) {
+    log(`🐶 WATCHDOG: offline too long — hard restart`);
+    touchActivity();
+    setTimeout(startBot, 2000);
+  }
+}, 60000);
+
+// ============ TELEGRAM COMMANDS ============
+tg.on('help', () => notify([
+  '<b>Owntown Bot — commands</b>',
+  '/status — live stats summary',
+  '/balance — balance + bank',
+  '/log [n] — last n log lines (default 15)',
+  '/pause — pause farming (stays connected)',
+  '/resume — resume farming',
+  '/restart — restart the process (systemd relaunches)',
+  '/reauth — force re-authentication',
+  '/help — this message',
+].join('\n')));
+tg.on('start', () => notify('👋 Bot is running. /help for commands.'));
+tg.on('status', () => notify(buildStatusText()));
+tg.on('stats', () => notify(buildStatusText()));
+tg.on('balance', () => notify(`💰 Balance: <b>${balance.toFixed(2)}</b> OTWN\n🏦 Bank withdrawable: ${stats.bankBalance}\n📅 Daily earned: ${dailyEarned}/${DAILY_EARN_CAP}`));
+tg.on('log', (args) => {
+  const n = Math.min(50, Math.max(1, parseInt(args[0] || '15', 10) || 15));
+  const lines = LOG_RING.slice(-n).join('\n') || '(no logs yet)';
+  notify('<pre>' + lines.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>');
+});
+tg.on('pause', () => { paused = true; log('⏸️ Paused via Telegram'); notify('⏸️ Farming <b>paused</b>. /resume to continue.'); });
+tg.on('resume', () => {
+  if (!paused) { notify('▶️ Already running.'); return; }
+  paused = false; log('▶️ Resumed via Telegram'); notify('▶️ Farming <b>resumed</b>.');
+  if (activeSocket && activeSocket.connected) runNextCycle(activeSocket);
+});
+tg.on('reauth', () => {
+  notify('🔑 Re-authenticating...'); token = null;
+  try { if (activeSocket) activeSocket.disconnect(); } catch {}
+  setTimeout(startBot, 1500);
+});
+tg.on('restart', () => { notify('♻️ Restarting process...'); setTimeout(() => process.exit(0), 800); });
+
+// ============ CRASH RECOVERY ============
+process.on('uncaughtException', (err) => {
+  log('💥 uncaughtException: ' + (err && err.stack || err));
+  notify(`💥 <b>Crash</b>: ${err && err.message || err}\nProcess will exit; systemd auto-restarts.`);
+  setTimeout(() => process.exit(1), 1200); // let the notify flush, then let systemd restart
+});
+process.on('unhandledRejection', (reason) => {
+  log('💥 unhandledRejection: ' + (reason && reason.stack || reason));
+});
+
+// ============ BOOT ============
+log('🚀 Starting v23 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram + Autopilot...');
+tg.startPolling();
+notify('🚀 <b>Owntown bot starting</b> — connecting to game...');
 startBot();
