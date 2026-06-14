@@ -89,6 +89,7 @@ function runAutoPatch(recipe, entry) {
     return;
   }
   // Record a pending patch so the next boot verifies connect within 60s, else rolls back.
+  // (PENDING_PATCH is last-write-wins; the rate limiter makes concurrent patches effectively impossible.)
   try { fs.writeFileSync(PENDING_PATCH, JSON.stringify({ recipe: recipe.name, sig: entry.sig, backup: res.backup, at: Date.now() })); } catch {}
   errorBus.setStatus(entry.sig, 'patched', recipe.name);
   log(`🔧 autopatch ${recipe.name} applied → restarting to verify`);
@@ -96,7 +97,26 @@ function runAutoPatch(recipe, entry) {
   setTimeout(() => process.exit(0), 1500); // systemd Restart=always brings it back patched
 }
 
+// Restore bot.js from a pending patch's backup, ALWAYS clear the pending marker, then restart.
+// `finally` guarantees we never get stuck if the backup is missing (cleared pending + exit anyway).
+function rollbackPatch(pend, why) {
+  try {
+    fs.copyFileSync(pend.backup, path.join(__dirname, 'bot.js'));
+    log(`↩️ autopatch ${pend.recipe} ROLLED BACK (${why})`);
+    notify(`↩️ <b>AutoPatch rolled back</b>: ${pend.recipe} — ${why}. Restarting clean.`);
+  } catch (e) {
+    log(`rollback failed (backup missing?): ${e.message} — clearing pending to avoid stuck state`);
+    notify(`⚠️ <b>AutoPatch rollback FAILED</b>: ${pend.recipe} (${e.message}). Cleared pending; patched code stays live.`);
+  } finally {
+    try { fs.unlinkSync(PENDING_PATCH); } catch {}
+    setTimeout(() => process.exit(0), 1500);
+  }
+}
+
 // Boot-time verification of any pending patch: connected within 60s → keep; else rollback + restart.
+// NOTE: while the pending marker exists (up to 60s post-patch), an UNRELATED crash also triggers
+// rollback (see uncaughtException). That fail-safe bias is intentional: reverting a small benign
+// patch is far cheaper than an unattended crash-loop.
 function verifyPendingPatchOnBoot() {
   let pend;
   try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')); } catch { return; }
@@ -109,13 +129,7 @@ function verifyPendingPatchOnBoot() {
       notify(`✅ <b>AutoPatch verified</b>: ${pend.recipe} — connection OK`);
     } else if (Date.now() > deadline) {
       clearInterval(iv);
-      try {
-        fs.copyFileSync(pend.backup, path.join(__dirname, 'bot.js'));
-        fs.unlinkSync(PENDING_PATCH);
-        log(`↩️ autopatch ${pend.recipe} ROLLED BACK (no connect in 60s)`);
-        notify(`↩️ <b>AutoPatch rolled back</b>: ${pend.recipe} — no connect in 60s. Restarting clean.`);
-        setTimeout(() => process.exit(0), 1500);
-      } catch (e) { log('rollback error: ' + e.message); }
+      rollbackPatch(pend, 'no connect in 60s');
     }
   }, 3000);
 }
@@ -1867,6 +1881,14 @@ tg.on('update', () => {
 // ============ CRASH RECOVERY ============
 process.on('uncaughtException', (err) => {
   log('💥 uncaughtException: ' + (err && err.stack || err));
+  // If an autopatch is pending/unverified, a crash likely means the patch broke us → roll it back
+  // instead of crash-looping into the same broken bot.js forever.
+  let pend; try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')); } catch {}
+  if (pend) {
+    notify(`💥 <b>Crash after AutoPatch</b> ${pend.recipe}: ${err && err.message || err} — rolling back.`);
+    rollbackPatch(pend, 'crashed after patch');
+    return;
+  }
   notify(`💥 <b>Crash</b>: ${err && err.message || err}\nProcess will exit; systemd auto-restarts.`);
   setTimeout(() => process.exit(1), 1200); // let the notify flush, then let systemd restart
 });
