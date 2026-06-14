@@ -7,6 +7,10 @@ const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
 const { startDashboard } = require('./dashboard');
 const crypto = require('crypto');
+const { ErrorBus, signature } = require('./errorbus');
+const selfheal = require('./selfheal');
+const path = require('path');
+const errorBus = new ErrorBus(path.join(__dirname, 'errors.json'));
 
 // ============ CONFIG (env-driven, see .env) ============
 const TOKEN_PATH = config.tokenPath;
@@ -38,6 +42,32 @@ const tg = new Telegram({
 });
 function notify(m) { tg.send(m); }                                   // always (profit reports, command replies, critical)
 function notifySys(m) { if (!config.notifyProfitOnly) tg.send(m); }  // routine/system events — muted when profit-only
+
+// ── Central error capture (Layer 1) + runtime self-heal (Layer 2) ──
+// category 'reconnect' = connection noise (ping/transport/auth timeout), counted
+// separately from farming errors so /status is honest. The AutoPatch trigger
+// (Layer 3) is wired in a later step.
+function reportError({ code, context, expected, zone, category }) {
+  if (category === 'reconnect') { stats.reconnects++; }
+  else { stats.errors++; stats.consecutiveErrors++; }
+  const entry = errorBus.record({ code, context, expected, zone });
+  const action = selfheal.decide({ code: entry.code, zone, count: entry.count });
+  if (action) {
+    applySelfHeal(action);
+    errorBus.setStatus(entry.sig, 'self-healed', action.type);
+  }
+  return entry;
+}
+
+function applySelfHeal(action) {
+  if (action.type === 'blacklist-zone' && !ZONE_BLACKLIST.includes(action.zone)) {
+    ZONE_BLACKLIST.push(action.zone);
+    log(`🩹 self-heal: avoid zone ${action.zone}`);
+  } else if (action.type === 'tune-reconnect-runtime') {
+    RECONNECT_BACKOFF_MS = Math.min(120000, Math.round(RECONNECT_BACKOFF_MS * 1.5));
+    log(`🩹 self-heal: reconnect backoff → ${RECONNECT_BACKOFF_MS}ms`);
+  }
+}
 
 // ============ AUTOPILOT STATE ============
 let paused = false;
@@ -190,7 +220,7 @@ const ACTIONS = {
 let stats = {
   mined:0,fished:0,fought:0,kills:0,xp:0,items:0,
   soldQuick:0,soldMarket:0,earnedQuick:0,earnedMarket:0,
-  listed:0,canceled:0,crafted:0,repaired:0,errors:0,
+  listed:0,canceled:0,crafted:0,repaired:0,errors:0,reconnects:0,
   consecutiveErrors:0,startTime:Date.now(),cycles:0,
   wrongZone:0,fishingTimeouts:0,fatigueDrops:0,restCount:0,
   currentNodeIdx:0,currentMonsterIdx:0,foodEaten:0,
@@ -1043,6 +1073,8 @@ function runNextCycle(sock) {
     if(expected && zone !== expected && zone !== 'unknown') {
       log(`⚠️ WRONG ZONE: expected ${expected}, got ${zone}`);
       stats.wrongZone++;
+      reportError({ code: 'WRONG_ZONE', expected, zone, context: `expected ${expected}, got ${zone}` });
+      if (ZONE_BLACKLIST.includes(expected)) { log(`⛔ ${expected} blacklisted — skip cycle`); setTimeout(() => runNextCycle(sock), 2000); return; }
       const target = ZONE_TARGETS[expected];
       if(target) {
         log(`🔄 Retrying walk to ${expected}...`);
@@ -1100,6 +1132,7 @@ async function startBot() {
     try { token = await authenticate(); }
     catch(e) {
       log('❌ Auth failed: ' + e.message);
+      if (/timeout/i.test(e.message)) reportError({ code: 'AUTH_TIMEOUT', context: 'auth request timeout', category: 'reconnect' });
       // Auto-detect "needs funding": wallet must hold >= required OTWN to play
       const m = e.message.match(/INSUFFICIENT_OTWN.*?"required":(\d+)/) || (e.message.includes('INSUFFICIENT_OTWN') ? [null, '5000'] : null);
       if (m) {
@@ -1188,7 +1221,7 @@ async function startBot() {
     log(`⛏ ${d.itemName} x${d.qty} +${d.xpGained}XP STA:${Math.round(d.stamina||0)} ${d.fatigueMultiplier<0.95?'⚠️fatigue':''} → ${sp.action}${sp.price?'@'+sp.price:''}`);
   });
   socket.on('mining:error', (d) => {
-    stats.errors++; stats.consecutiveErrors++;
+    reportError({ code: d.code, context: `mining ${d.code}` });
     if(d.code !== 'COOLDOWN') log(`⛏ ERR:${d.code}`);
   });
 
@@ -1200,7 +1233,7 @@ async function startBot() {
     const sp = getSellDecision(d.defId || 'fish', d.qty || 1);
     log(`🎣 ${d.itemName||d.defId||'fish'} x${d.qty||1} +${d.xp||d.xpGained||0}XP → ${sp.action}${sp.price?'@'+sp.price:''}${sp.reason?' ('+sp.reason+')':''}`);
   });
-  socket.on('fishing:error', (d) => { fishingActive = false; stats.errors++; stats.consecutiveErrors++; log(`🎣 ERR:${d.code}`); });
+  socket.on('fishing:error', (d) => { fishingActive = false; reportError({ code: d.code, context: `fishing ${d.code}`, zone }); log(`🎣 ERR:${d.code}`); });
 
   // === COMBAT ===
   socket.on('combat:result', (d) => {
@@ -1211,7 +1244,7 @@ async function startBot() {
     if(d.killed) { stats.kills++; log(`⚔ KILL! +${d.xpGained}XP`); }
   });
   socket.on('combat:error', (d) => {
-    stats.errors++; stats.consecutiveErrors++;
+    reportError({ code: d.code, context: `combat ${d.code}` });
     if(d.code === 'NO_TARGET') {
       stats.currentMonsterIdx = (stats.currentMonsterIdx + 1) % MONSTERS.length;
       log(`⚔ NO_TARGET → next monster: ${MONSTERS[stats.currentMonsterIdx].id}`);
@@ -1446,6 +1479,7 @@ async function startBot() {
     log('Disconnected! reason: ' + reason);
     connected = false;
     if (stopped) { log('⏹️ stopped — not reconnecting'); return; }
+    reportError({ code: reason, context: 'socket disconnect', category: 'reconnect' });
     notifySys(`🔴 <b>Disconnected</b> — auto-reconnect in ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);
     scheduleStart(RECONNECT_BACKOFF_MS);
   });
@@ -1453,6 +1487,7 @@ async function startBot() {
   socket.on('connect_error', (err) => {
     log('⚠️ connect_error: ' + (err && err.message || err));
     if (stopped) return;
+    reportError({ code: (err && err.message) || 'connect_error', context: 'connect_error', category: 'reconnect' });
     // clear token so the next attempt re-authenticates (covers stale/expired/rejected tokens)
     token = null;
     try { socket.disconnect(); } catch {}
