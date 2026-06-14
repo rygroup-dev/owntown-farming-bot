@@ -559,10 +559,22 @@ function vehicleBuy(sock, defId) {
   }
 }
 
-// ============ MARKET FLIP (smart, aggressive, balance-safe) ============
+// ============ MARKET FLIP (measured, balance-safe, daily-capped) ============
 let lastFlipTime = 0;
+let buySpentToday = 0;
+let buyDay = new Date().toISOString().slice(0, 10);
 
 function spendableBalance() { return balance - config.balanceReserve; }
+function rolloverBuyDay() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== buyDay) { buyDay = today; buySpentToday = 0; }
+}
+// gate every purchase: respects reserve AND daily buy cap
+function canSpend(amount) {
+  rolloverBuyDay();
+  return spendableBalance() >= amount && (buySpentToday + amount) <= config.dailyBuyCap;
+}
+function recordSpend(amount) { rolloverBuyDay(); buySpentToday += amount; }
 
 function checkFlipOpportunities(sock, listings) {
   if(!config.flipEnabled) return false;
@@ -581,7 +593,7 @@ function checkFlipOpportunities(sock, listings) {
     const profit = resaleRevenue - totalCost;
     // aggressive: buy if priced under flipUnderprice of market, within budget + reserve
     if(ppu < marketPrice * config.flipUnderprice && l.price <= config.flipMaxCost &&
-       profit >= config.flipMinProfit && spendableBalance() >= totalCost) {
+       profit >= config.flipMinProfit && canSpend(totalCost)) {
       if(profit > bestProfit) { bestProfit = profit; bestFlip = { listing: l, ppu, marketPrice, profit, totalCost }; }
     }
   }
@@ -591,6 +603,7 @@ function checkFlipOpportunities(sock, listings) {
     notify(`🔄 <b>Flip beli</b> ${cleanName(l.defId)} x${l.qty} @${l.price}\n<i>market ${bestFlip.marketPrice} · est profit +${bestFlip.profit}</i>`);
     sock.emit('marketplace:buy', { listingId: l.id });
     stats.itemsBought++; stats.itemsFlipped++;
+    recordSpend(bestFlip.totalCost);
     lastFlipTime = Date.now();
     return true;
   }
@@ -619,7 +632,7 @@ function checkPowerupBuys(sock, listings) {
     for(const l of listings) {
       if(l.sellerPlayerId === MY_PLAYER_ID || l.status !== 'active' || l.defId !== defId) continue;
       const ppu = l.price / (l.qty || 1);
-      if(ppu <= want.maxPrice && spendableBalance() >= l.price) {
+      if(ppu <= want.maxPrice && canSpend(l.price)) {
         if(!best || l.price < best.price) best = l;
       }
     }
@@ -628,6 +641,7 @@ function checkPowerupBuys(sock, listings) {
       notify(`🆙 <b>Beli powerup</b> ${cleanName(defId)} x${best.qty||1} @${best.price}`);
       sock.emit('marketplace:buy', { listingId: best.id });
       stats.itemsBought++;
+      recordSpend(best.price);
       if(want.equip) pendingEquip = defId; // try to equip after it lands in inventory
       lastPowerupTime = Date.now();
       return true;
@@ -1483,7 +1497,9 @@ function getSnapshot() {
       flip: config.flipEnabled ? `< ${Math.round(config.flipUnderprice*100)}% mkt, max ${config.flipMaxCost}, cd ${config.flipCooldownSec}s` : 'off',
       reserve: config.balanceReserve,
       powerup: config.powerupEnabled ? 'on' : 'off',
+      buyCap: config.dailyBuyCap,
     },
+    buySpent: buySpentToday,
   };
 }
 

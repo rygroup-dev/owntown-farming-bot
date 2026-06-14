@@ -69,13 +69,14 @@ const config = {
   dashUser: process.env.DASH_USER || 'admin',
   dashPass: process.env.DASH_PASS || '',
 
-  // Trading / flip strategy (aggressive auto-buy underpriced)
+  // Trading / flip strategy (measured, not reckless)
   flipEnabled: (process.env.FLIP_ENABLED || 'true').toLowerCase() === 'true',
-  flipMaxCost: parseInt(process.env.FLIP_MAX_COST || '5000', 10),      // max OTWN per flip
-  flipCooldownSec: parseInt(process.env.FLIP_COOLDOWN_SEC || '20', 10),
-  flipUnderprice: parseFloat(process.env.FLIP_UNDERPRICE || '0.6'),    // buy if ppu < this * market
-  flipMinProfit: parseInt(process.env.FLIP_MIN_PROFIT || '80', 10),
-  balanceReserve: parseInt(process.env.BALANCE_RESERVE || '2000', 10), // never spend below this
+  flipMaxCost: parseInt(process.env.FLIP_MAX_COST || '1000', 10),       // max OTWN per flip
+  flipCooldownSec: parseInt(process.env.FLIP_COOLDOWN_SEC || '60', 10),
+  flipUnderprice: parseFloat(process.env.FLIP_UNDERPRICE || '0.45'),    // only clearly underpriced (<45% market)
+  flipMinProfit: parseInt(process.env.FLIP_MIN_PROFIT || '150', 10),    // only worthwhile profit
+  balanceReserve: parseInt(process.env.BALANCE_RESERVE || '5000', 10),  // never spend below this
+  dailyBuyCap: parseInt(process.env.DAILY_BUY_CAP || '3000', 10),       // max OTWN spent on buys per day
 
   // Auto-powerup: buy items that help leveling/sustained farming
   powerupEnabled: (process.env.POWERUP_ENABLED || 'true').toLowerCase() === 'true',
