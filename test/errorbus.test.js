@@ -40,3 +40,13 @@ test('setStatus and top(n) work', () => {
   assert.strictEqual(bus.top(1)[0].sig, 'A||');
   fs.unlinkSync(file);
 });
+
+test('corrupt KB file (non-object JSON) falls back to empty object', () => {
+  const file = path.join(os.tmpdir(), `kb-${Date.now()}-3.json`);
+  fs.writeFileSync(file, JSON.stringify('not an object'));
+  const bus = new ErrorBus(file);
+  assert.deepStrictEqual(bus.all(), []);
+  const e1 = bus.record({ code: 'PING_TIMEOUT' });
+  assert.strictEqual(e1.count, 1);
+  fs.unlinkSync(file);
+});

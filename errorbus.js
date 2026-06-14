@@ -14,12 +14,20 @@ class ErrorBus {
   constructor(kbPath) {
     this.path = kbPath;
     this.kb = {};
-    try { this.kb = JSON.parse(fs.readFileSync(kbPath, 'utf8')); } catch { this.kb = {}; }
+    try {
+      const data = JSON.parse(fs.readFileSync(kbPath, 'utf8'));
+      if (data && typeof data === 'object' && !Array.isArray(data)) this.kb = data;
+    } catch { this.kb = {}; }
   }
   _persist() {
     const tmp = this.path + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(this.kb, null, 2));
-    fs.renameSync(tmp, this.path); // atomic
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(this.kb, null, 2));
+      fs.renameSync(tmp, this.path); // atomic
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch {}
+      throw e;
+    }
   }
   record(err) {
     const sig = signature(err);
@@ -42,6 +50,7 @@ class ErrorBus {
   all() { return Object.values(this.kb); }
   top(n) { return this.all().sort((a, b) => b.count - a.count).slice(0, n); }
   setStatus(sig, status, lastAction) {
+    // No-op if sig unknown: callers always setStatus a signature they just record()'d.
     if (this.kb[sig]) { this.kb[sig].status = status; this.kb[sig].lastAction = lastAction || this.kb[sig].lastAction; this._persist(); }
   }
 }
