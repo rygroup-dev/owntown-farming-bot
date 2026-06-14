@@ -55,26 +55,33 @@ const RECIPES = [
   {
     name: 'blacklist-zone', region: 'ZONE_BLACKLIST',
     match: e => e.code === 'WRONG_ZONE' && !!e.zone,
-    patch: (body, e) => body.replace(
+    patch: (body, e) => {
+      if (/['\\]/.test(e.zone)) return body;   // blacklist-zone: skip unsafe zone names
+      return body.replace(
       /(const ZONE_BLACKLIST = \[)([^\]]*)(\];)/,
       (_, a, mid, c) => {
         const items = mid.split(',').map(s => s.trim()).filter(Boolean);
         const q = `'${e.zone}'`;
         if (!items.includes(q)) items.push(q);
         return `${a}${items.join(', ')}${c}`;
-      }),
+      });
+    },
   },
+  // Catch-all fallback — MUST remain LAST in RECIPES (later entries would be unreachable).
   {
     name: 'register-error-code', region: 'ERROR_HANDLERS',
     match: () => true, // fallback: any unknown recurring code gets a safe default handler
-    patch: (body, e) => body.replace(
+    patch: (body, e) => {
+      if (/['\\]/.test(e.code)) return body;   // register-error-code: skip unsafe codes
+      return body.replace(
       /(const KNOWN_ERROR_CODES = \[)([^\]]*)(\];)/,
       (_, a, mid, c) => {
         const items = mid.split(',').map(s => s.trim()).filter(Boolean);
         const q = `'${e.code}'`;
         if (!items.includes(q)) items.push(q);
         return `${a}${items.join(', ')}${c}`;
-      }),
+      });
+    },
   },
 ];
 
@@ -89,8 +96,9 @@ function applyRecipe(recipe, { sourcePath, backupDir, entry }) {
   const original = fs.readFileSync(sourcePath, 'utf8');
   const stamp = Date.now();
   const backup = path.join(backupDir, `${path.basename(sourcePath)}.bak.${stamp}`);
-  fs.writeFileSync(backup, original);
+  let sourceMutated = false;
   try {
+    fs.writeFileSync(backup, original);
     const start = `// === AUTOPATCH:${recipe.region}:START ===`;
     const end = `// === AUTOPATCH:${recipe.region}:END ===`;
     const si = original.indexOf(start), ei = original.indexOf(end);
@@ -99,10 +107,11 @@ function applyRecipe(recipe, { sourcePath, backupDir, entry }) {
     const newBody = recipe.patch(body, entry);
     const patched = replaceRegion(original, recipe.region, newBody);
     fs.writeFileSync(sourcePath, patched);
+    sourceMutated = true;
     execFileSync(process.execPath, ['--check', sourcePath]); // throws on parse error
     return { ok: true, backup, recipe: recipe.name };
   } catch (err) {
-    fs.writeFileSync(sourcePath, original); // rollback
+    if (sourceMutated) { try { fs.writeFileSync(sourcePath, original); } catch {} } // rollback
     return { ok: false, error: String(err && err.message || err), backup };
   }
 }

@@ -84,3 +84,19 @@ test('applyRecipe rolls back when the patch would not parse', () => {
   assert.strictEqual(fs.readFileSync(src, 'utf8'), original);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('blacklist-zone recipe skips unsafe zone names (quote/backslash injection guard)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-'));
+  const src = path.join(dir, 'fixture.js');
+  const original = [
+    '// === AUTOPATCH:ZONE_BLACKLIST:START ===',
+    'const ZONE_BLACKLIST = [];',
+    '// === AUTOPATCH:ZONE_BLACKLIST:END ===',
+  ].join('\n');
+  fs.writeFileSync(src, original);
+  const recipe = selectRecipe({ code: 'WRONG_ZONE', zone: "bad'zone", count: AUTOPATCH_THRESHOLD });
+  const res = applyRecipe(recipe, { sourcePath: src, backupDir: dir, entry: { code: 'WRONG_ZONE', zone: "bad'zone", count: 5 } });
+  assert.strictEqual(res.ok, true);
+  assert.strictEqual(fs.readFileSync(src, 'utf8'), original);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
