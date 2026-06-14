@@ -1014,7 +1014,7 @@ async function startBot() {
     fundingNotified = false; // auth succeeded -> reset for next time
   }
 
-  const socket = io('https://' + GAME_HOST, { auth: { token }, transports: ['polling', 'websocket'], reconnection: false });
+  const socket = io('https://' + GAME_HOST, { auth: { token }, transports: ['polling'], upgrade: false, reconnection: false });
 
   // === PLAYER STATE ===
   socket.on('player:correction', (d) => { if(d.pos) { pos.x = d.pos.x; pos.z = d.pos.z; } });
@@ -1316,8 +1316,8 @@ async function startBot() {
     }, 3000);
   });
 
-  socket.on('disconnect', () => {
-    log('Disconnected!');
+  socket.on('disconnect', (reason) => {
+    log('Disconnected! reason: ' + reason);
     connected = false;
     if (stopped) { log('⏹️ stopped — not reconnecting'); return; }
     notifySys(`🔴 <b>Disconnected</b> — auto-reconnect in 30s`);
