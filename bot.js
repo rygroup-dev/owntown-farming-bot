@@ -11,6 +11,11 @@ const { ErrorBus } = require('./errorbus');
 const selfheal = require('./selfheal');
 const path = require('path');
 const errorBus = new ErrorBus(path.join(__dirname, 'errors.json'));
+const autopatch = require('./autopatch');
+const patchLimiter = new autopatch.RateLimiter(10 * 60000, 60 * 60000, 1, 3); // max 1/10min, 3/hour
+const BACKUP_DIR = path.join(__dirname, '.autopatch-backups');
+const PENDING_PATCH = path.join(__dirname, '.autopatch-pending.json');
+try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); } catch {}
 
 // ============ CONFIG (env-driven, see .env) ============
 const TOKEN_PATH = config.tokenPath;
@@ -43,18 +48,24 @@ const tg = new Telegram({
 function notify(m) { tg.send(m); }                                   // always (profit reports, command replies, critical)
 function notifySys(m) { if (!config.notifyProfitOnly) tg.send(m); }  // routine/system events — muted when profit-only
 
-// ── Central error capture (Layer 1) + runtime self-heal (Layer 2) ──
+// ── Central error capture (L1) + runtime self-heal (L2) + autopatch trigger (L3) ──
 // category 'reconnect' = connection noise (ping/transport/auth timeout), counted
-// separately from farming errors so /status is honest. The AutoPatch trigger
-// (Layer 3) is wired in a later step.
+// separately from farming errors so /status is honest.
 function reportError({ code, context, expected, zone, category }) {
   if (category === 'reconnect') { stats.reconnects++; }
   else { stats.errors++; stats.consecutiveErrors++; }
   const entry = errorBus.record({ code, context, expected, zone });
+  const alreadyPatched = entry.status === 'patched'; // never downgrade or re-patch a patched sig
+
   const action = selfheal.decide({ code: entry.code, zone, count: entry.count });
   if (action) {
     applySelfHeal(action);
-    errorBus.setStatus(entry.sig, 'self-healed', action.type);
+    if (!alreadyPatched) errorBus.setStatus(entry.sig, 'self-healed', action.type);
+  }
+
+  const recipe = autopatch.selectRecipe({ code: entry.code, zone, count: entry.count });
+  if (recipe && !alreadyPatched && patchLimiter.tryAcquire(Date.now())) {
+    runAutoPatch(recipe, entry);
   }
   return entry;
 }
@@ -67,6 +78,46 @@ function applySelfHeal(action) {
     RECONNECT_BACKOFF_MS = Math.min(120000, Math.round(RECONNECT_BACKOFF_MS * 1.5));
     log(`🩹 self-heal: reconnect backoff → ${RECONNECT_BACKOFF_MS}ms`);
   }
+}
+
+// ── AutoPatch runtime (Layer 3): apply recipe to bot.js source, restart, verify ──
+function runAutoPatch(recipe, entry) {
+  const res = autopatch.applyRecipe(recipe, { sourcePath: path.join(__dirname, 'bot.js'), backupDir: BACKUP_DIR, entry });
+  if (!res.ok) {
+    log(`🔧 autopatch ${recipe.name} FAILED parse-check — not applied (${res.error})`);
+    notify(`🔧 <b>AutoPatch aborted</b>\nRecipe: ${recipe.name}\nError: ${res.error}`);
+    return;
+  }
+  // Record a pending patch so the next boot verifies connect within 60s, else rolls back.
+  try { fs.writeFileSync(PENDING_PATCH, JSON.stringify({ recipe: recipe.name, sig: entry.sig, backup: res.backup, at: Date.now() })); } catch {}
+  errorBus.setStatus(entry.sig, 'patched', recipe.name);
+  log(`🔧 autopatch ${recipe.name} applied → restarting to verify`);
+  notify(`🔧 <b>AutoPatch applied</b>\nRecipe: ${recipe.name}\nError: ${entry.code} (×${entry.count})\nRestarting to verify…`);
+  setTimeout(() => process.exit(0), 1500); // systemd Restart=always brings it back patched
+}
+
+// Boot-time verification of any pending patch: connected within 60s → keep; else rollback + restart.
+function verifyPendingPatchOnBoot() {
+  let pend;
+  try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')); } catch { return; }
+  const deadline = Date.now() + 60000;
+  const iv = setInterval(() => {
+    if (connected) {
+      clearInterval(iv);
+      try { fs.unlinkSync(PENDING_PATCH); } catch {}
+      log(`✅ autopatch ${pend.recipe} verified (connected)`);
+      notify(`✅ <b>AutoPatch verified</b>: ${pend.recipe} — connection OK`);
+    } else if (Date.now() > deadline) {
+      clearInterval(iv);
+      try {
+        fs.copyFileSync(pend.backup, path.join(__dirname, 'bot.js'));
+        fs.unlinkSync(PENDING_PATCH);
+        log(`↩️ autopatch ${pend.recipe} ROLLED BACK (no connect in 60s)`);
+        notify(`↩️ <b>AutoPatch rolled back</b>: ${pend.recipe} — no connect in 60s. Restarting clean.`);
+        setTimeout(() => process.exit(0), 1500);
+      } catch (e) { log('rollback error: ' + e.message); }
+    }
+  }, 3000);
 }
 
 // ============ AUTOPILOT STATE ============
@@ -1873,6 +1924,7 @@ setInterval(() => {
 
 // ============ BOOT ============
 log('🚀 Starting v23 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram + Autopilot...');
+verifyPendingPatchOnBoot();
 tg.startPolling();
 notifySys('🚀 <b>Owntown Bot</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /dashboard untuk panel live</i>');
 startBot();
