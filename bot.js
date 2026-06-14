@@ -116,7 +116,7 @@ const ZONE_TARGETS = {
   food_row: {x:20, z:55},
   market: {x:25, z:-15},
   garage: {x:45, z:-30},
-  arena: {x:-120, z:-80},
+  arena: {x:194, z:-185},
   property: {x:30, z:40},
 };
 
