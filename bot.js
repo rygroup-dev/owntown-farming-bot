@@ -1008,7 +1008,7 @@ async function startBot() {
     fundingNotified = false; // auth succeeded -> reset for next time
   }
 
-  const socket = io('https://' + GAME_HOST, { auth: { token }, transports: ['websocket'] });
+  const socket = io('https://' + GAME_HOST, { auth: { token }, transports: ['polling', 'websocket'], reconnection: false });
 
   // === PLAYER STATE ===
   socket.on('player:correction', (d) => { if(d.pos) { pos.x = d.pos.x; pos.z = d.pos.z; } });
@@ -1324,12 +1324,12 @@ async function startBot() {
   });
 
   socket.on('connect_error', (err) => {
-    if(err.message === 'BAD_TOKEN' || err.message === 'NO_TOKEN') {
-      log('🔑 Token invalid, re-authenticating...');
-      token = null;
-      socket.disconnect();
-      scheduleStart(2000);
-    }
+    log('⚠️ connect_error: ' + (err && err.message || err));
+    if (stopped) return;
+    // clear token so the next attempt re-authenticates (covers stale/expired/rejected tokens)
+    token = null;
+    try { socket.disconnect(); } catch {}
+    scheduleStart(5000);
   });
 
   function waitForInventory(sock, cb) {
