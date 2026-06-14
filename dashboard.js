@@ -90,6 +90,7 @@ pre{background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:1
    <div class="row"><span>👹 Boss claims</span><b id="boss">—</b></div>
    <div class="row"><span>⚠️ Errors</span><b id="err">—</b></div>
  </div>
+ <div class="card" style="grid-column:1/-1"><h2>📈 Profit / hour — last 12h</h2><canvas id="chart" height="200"></canvas></div>
  <div class="card" style="grid-column:1/-1"><h2>📊 Market prices</h2><div id="market" class="mono">—</div></div>
  <div class="card" style="grid-column:1/-1"><h2>📜 Recent log</h2><pre id="log">—</pre></div>
 </div><div class="foot">auto-refresh 5s · Owntown Farming Bot</div></div>
@@ -121,8 +122,32 @@ async function tick(){
   $('flips').textContent=fmt(d.flips);$('crafts').textContent=fmt(d.crafted);$('boss').textContent=fmt(d.bossClaims);
   $('err').textContent=fmt(d.errors);
   $('market').textContent=d.market||'(no data yet)';
+  drawChart(d.hourly||[]);
   $('log').textContent=(d.log||[]).join('\\n');$('log').scrollTop=$('log').scrollHeight;
  }catch(e){$('state').textContent='⚠️ '+e.message}
+}
+function drawChart(data){
+ const c=$('chart');if(!c)return;
+ const dpr=window.devicePixelRatio||1, W=c.clientWidth||c.parentElement.clientWidth-28, H=200;
+ c.width=W*dpr;c.height=H*dpr;c.style.width=W+'px';c.style.height=H+'px';
+ const x=c.getContext('2d');x.scale(dpr,dpr);x.clearRect(0,0,W,H);
+ const padL=46,padB=22,padT=10,padR=8;
+ const cw=W-padL-padR, ch=H-padT-padB;
+ const max=Math.max(1,...data.map(d=>d.v));
+ // gridlines + y labels
+ x.font='10px system-ui';x.textBaseline='middle';
+ for(let i=0;i<=4;i++){const gy=padT+ch*i/4;const val=Math.round(max*(1-i/4));
+   x.strokeStyle='#243049';x.beginPath();x.moveTo(padL,gy);x.lineTo(W-padR,gy);x.stroke();
+   x.fillStyle='#8aa0c0';x.textAlign='right';x.fillText(val.toLocaleString(),padL-6,gy);}
+ const n=data.length, bw=cw/n*0.62, gap=cw/n;
+ data.forEach((d,i)=>{
+   const bh=Math.max(d.v>0?2:0, ch*d.v/max), bx=padL+gap*i+(gap-bw)/2, by=padT+ch-bh;
+   const g=x.createLinearGradient(0,by,0,padT+ch);g.addColorStop(0,'#5cffa0');g.addColorStop(1,'#1f9e5a');
+   x.fillStyle=d.v>0?g:'#243049';
+   if(x.roundRect){x.beginPath();x.roundRect(bx,by,bw,bh,4);x.fill();}else{x.fillRect(bx,by,bw,bh);}
+   x.fillStyle='#8aa0c0';x.textAlign='center';x.fillText(d.h,bx+bw/2,H-padB+12);
+   if(d.v>0){x.fillStyle='#e6edf6';x.font='9px system-ui';x.fillText(d.v>=1000?(d.v/1000).toFixed(1)+'k':d.v,bx+bw/2,by-7);x.font='10px system-ui';}
+ });
 }
 tick();setInterval(tick,5000);
 </script></body></html>`;

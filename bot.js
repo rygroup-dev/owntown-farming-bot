@@ -351,12 +351,33 @@ function getSellDecision(defId, qty) {
   return { action: 'QUICKSELL', price: qsPrice };
 }
 
+// ---- hourly profit tracking (for dashboard chart) ----
+let hourlyProfit = {}; // hourKey (epoch hours) -> OTWN earned that hour
+function bucketEarn(amount) {
+  if(!amount || amount <= 0) return;
+  const k = Math.floor(Date.now() / 3600000);
+  hourlyProfit[k] = (hourlyProfit[k] || 0) + amount;
+  const keys = Object.keys(hourlyProfit).map(Number).sort((a,b)=>a-b);
+  while(keys.length > 48) delete hourlyProfit[keys.shift()]; // keep ~2 days
+}
+function getHourly(n = 12) {
+  const cur = Math.floor(Date.now() / 3600000);
+  const out = [];
+  for(let i = n - 1; i >= 0; i--) {
+    const k = cur - i;
+    const d = new Date(k * 3600000);
+    out.push({ h: String(d.getHours()).padStart(2,'0'), v: Math.round(hourlyProfit[k] || 0) });
+  }
+  return out;
+}
+
 function recordSale(defId, qty, method, price) {
   const total = price * qty;
   stats.totalRevenue += total;
   stats.totalItemsSold += qty;
   if(method === 'quickSell') { stats.soldQuick += qty; stats.earnedQuick += total; }
   else { stats.soldMarket += qty; stats.earnedMarket += total; }
+  bucketEarn(total);
   log(`💰 ${method==='quickSell'?'QS':'MKT'} ${defId} x${qty} @${price} = ${total} OTWN`);
 }
 
@@ -1104,6 +1125,7 @@ async function startBot() {
       stats.pvpWins++;
       const reward = d.reward || d.otwn || 0;
       stats.pvpEarnings += reward;
+      bucketEarn(reward);
       log(`⚔️ PvP WIN! +${reward} OTWN +${d.xp||0}XP`);
     } else {
       log(`⚔️ PvP LOSS ${d.xp ? '+'+d.xp+'XP' : ''}`);
@@ -1128,7 +1150,7 @@ async function startBot() {
       log(`🏠 Property action OK: ${d.action || 'unknown'}`);
       if(d.action === 'buy') stats.propertyBought++;
       if(d.action === 'sell') stats.propertySold++;
-      if(d.earnings) stats.propertyEarnings += d.earnings;
+      if(d.earnings) { stats.propertyEarnings += d.earnings; bucketEarn(d.earnings); }
     } else {
       log(`🏠 Property fail: ${d.code || d.message}`);
     }
@@ -1355,7 +1377,7 @@ function getSnapshot() {
     level, xp: stats.xp, hp, maxHp, stamina, zone, invCount: inventory.length, carryCap: CARRY_CAP,
     mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
     crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
-    market, log: LOG_RING.slice(-40),
+    market, log: LOG_RING.slice(-40), hourly: getHourly(12),
   };
 }
 
