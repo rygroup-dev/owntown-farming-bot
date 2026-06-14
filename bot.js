@@ -64,6 +64,19 @@ const CARRY_CAP = 56;
 const MARKET_INTERVAL = 3500;
 const LOW_DURABILITY = 30;
 const FISHING_TIMEOUT = 120000;
+// === AUTOPATCH:TIMEOUTS:START ===
+let REST_TIMEOUT = 20000;
+let AUTH_TIMEOUT = 20000;
+// === AUTOPATCH:TIMEOUTS:END ===
+// === AUTOPATCH:RECONNECT:START ===
+let RECONNECT_BACKOFF_MS = 30000;
+// === AUTOPATCH:RECONNECT:END ===
+// === AUTOPATCH:ZONE_BLACKLIST:START ===
+const ZONE_BLACKLIST = [];
+// === AUTOPATCH:ZONE_BLACKLIST:END ===
+// === AUTOPATCH:ERROR_HANDLERS:START ===
+const KNOWN_ERROR_CODES = ['COOLDOWN', 'NO_TARGET', 'WRONG_ZONE'];
+// === AUTOPATCH:ERROR_HANDLERS:END ===
 const UNDERCUT_PCT = 0.08;
 const LOW_STAMINA = 30;
 const FATIGUE_THRESHOLD = 0.80;
@@ -207,14 +220,14 @@ let economyLedger = [];
 let notifications = [];
 
 // ============ REST API ============
-function apiRequest(method, path, body, token) {
+function apiRequest(method, path, body, token, timeoutMs = REST_TIMEOUT) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
     const headers = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = `Bearer ${token}`;
     if (data) headers['Content-Length'] = Buffer.byteLength(data);
     const req = https.request({
-      hostname: GAME_HOST, path, method, headers, timeout: 20000
+      hostname: GAME_HOST, path, method, headers, timeout: timeoutMs
     }, (res) => {
       let d = '';
       res.on('data', c => d += c);
@@ -230,8 +243,8 @@ function apiRequest(method, path, body, token) {
   });
 }
 
-async function apiGet(path, token) { return apiRequest('GET', path, null, token); }
-async function apiPost(path, body, token) { return apiRequest('POST', path, body, token); }
+async function apiGet(path, token, timeoutMs) { return apiRequest('GET', path, null, token, timeoutMs); }
+async function apiPost(path, body, token, timeoutMs) { return apiRequest('POST', path, body, token, timeoutMs); }
 
 // ============ AUTH ============
 function loadSecretKey() {
@@ -257,7 +270,7 @@ async function authenticate() {
     WALLET_ADDR = bs58.encode(secretKey.slice(32));
     log(`🔑 Derived wallet address: ${WALLET_ADDR}`);
   }
-  const challenge = await apiPost('/api/auth/challenge', { wallet: WALLET_ADDR });
+  const challenge = await apiPost('/api/auth/challenge', { wallet: WALLET_ADDR }, undefined, AUTH_TIMEOUT);
   // Guard against flaky/502 challenge responses — don't sign garbage
   if (challenge.status !== 200 || !challenge.data || typeof challenge.data !== 'object') {
     throw new Error(`Challenge failed (status ${challenge.status}): ${typeof challenge.data === 'string' ? challenge.data.slice(0,80) : JSON.stringify(challenge.data)}`);
@@ -266,7 +279,7 @@ async function authenticate() {
   if (!nonce) throw new Error('Challenge returned no nonce: ' + JSON.stringify(challenge.data).slice(0,120));
   const message = challenge.data.message || ('owntown_auth:' + nonce);
   const sig = nacl.sign.detached(Buffer.from(message), secretKey);
-  const result = await apiPost('/api/auth/verify', { wallet: WALLET_ADDR, nonce, signature: bs58.encode(sig) });
+  const result = await apiPost('/api/auth/verify', { wallet: WALLET_ADDR, nonce, signature: bs58.encode(sig) }, undefined, AUTH_TIMEOUT);
   if (!result.data.token) throw new Error('Auth failed: ' + JSON.stringify(result.data));
   try { fs.writeFileSync(TOKEN_PATH, result.data.token); } catch (e) { /* ignore */ }
   log('🔑 Authenticated! Token valid until ' + new Date(JSON.parse(Buffer.from(result.data.token.split('.')[1],'base64')).exp*1000).toISOString());
@@ -1433,8 +1446,8 @@ async function startBot() {
     log('Disconnected! reason: ' + reason);
     connected = false;
     if (stopped) { log('⏹️ stopped — not reconnecting'); return; }
-    notifySys(`🔴 <b>Disconnected</b> — auto-reconnect in 30s`);
-    scheduleStart(30000);
+    notifySys(`🔴 <b>Disconnected</b> — auto-reconnect in ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);
+    scheduleStart(RECONNECT_BACKOFF_MS);
   });
 
   socket.on('connect_error', (err) => {
