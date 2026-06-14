@@ -1406,7 +1406,8 @@ async function startBot() {
     if(d.entries) {
       economyLedger = d.entries;
       const recent = d.entries.slice(0, 5);
-      log(`📊 Ledger: ${d.entries.length} entries, recent: ${recent.map(e => `${e.type}:${e.amount}`).join(', ')}`);
+      const fmtEntry = e => `${e.type || e.kind || e.reason || 'entry'}:${e.amount ?? e.delta ?? e.value ?? 0}`;
+      log(`📊 Ledger: ${d.entries.length} entries, recent: ${recent.map(fmtEntry).join(', ')}`);
     }
   });
 
@@ -1600,7 +1601,7 @@ function buildStatusText() {
     `🎒 <b>Character & Activity</b>`,
     `❤️ ${hp}/${maxHp}   ⚡ ${stamina}   📦 ${inventory.length}/${CARRY_CAP}   ⏸ held ${stats.holdCount}`,
     `⛏ ${fmt(stats.mined)}  🎣 ${fmt(stats.fished)}  ⚔ ${fmt(stats.kills)}  🛒 ${fmt(stats.itemsBought)}  🔨 ${fmt(stats.crafted)}  👹 ${fmt(stats.bossClaims)}`,
-    `${stats.errors ? '⚠️' : '✅'} errors ${stats.errors}   🌀 wrongzone ${stats.wrongZone}`,
+    `${stats.errors ? '⚠️' : '✅'} errors ${stats.errors}   🔌 reconnects ${stats.reconnects || 0}   🌀 wrongzone ${stats.wrongZone}`,
   ].join('\n');
 }
 
@@ -1762,6 +1763,7 @@ tg.on('help', () => notify([
   '/income — rincian pendapatan',
   '/health — kesehatan sistem',
   '/errors — error terakhir',
+  '/selfix — status self-fix system',
   '/schedule — jadwal anti-detect',
   '/ping — cek bot hidup',
   '/restart — restart proses',
@@ -1841,8 +1843,31 @@ tg.on('health', () => {
   ].join('\n'));
 });
 tg.on('errors', () => {
+  const esc = s => s.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
   const errs = LOG_RING.filter(l => /ERR|❌|💥|⚠️|fail/i.test(l)).slice(-12);
-  notify('⚠️ <b>Recent errors</b>\n<pre>' + (errs.join('\n').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) || 'none 🎉') + '</pre>');
+  const top = errorBus.top(5).map(e => `${e.code} ×${e.count} [${e.status}]${e.lastAction ? ' ' + e.lastAction : ''}`);
+  notify(
+    '🧯 <b>Errors (KB top 5)</b>\n<pre>' + (esc(top.join('\n')) || 'none') + '</pre>\n' +
+    '<b>Recent log</b>\n<pre>' + (esc(errs.join('\n')) || 'none 🎉') + '</pre>'
+  );
+});
+tg.on('selfix', () => {
+  const esc = s => s.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  const top = errorBus.top(5).map(e => `${e.code} ×${e.count} [${e.status}]`);
+  let pend = 'none'; try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')).recipe; } catch {}
+  let backups = 0; try { backups = fs.readdirSync(BACKUP_DIR).length; } catch {}
+  notify([
+    '🩺 <b>Self-Fix</b>',
+    '<pre>',
+    `Blacklisted zones   ${ZONE_BLACKLIST.join(', ') || 'none'}`,
+    `Reconnect backoff   ${RECONNECT_BACKOFF_MS}ms`,
+    `Pending patch       ${pend}`,
+    `Backups kept        ${backups}`,
+    `KB signatures       ${errorBus.all().length}`,
+    '</pre>',
+    '<b>Top signatures</b>',
+    '<pre>' + (esc(top.join('\n')) || 'none') + '</pre>',
+  ].join('\n'));
 });
 tg.on('inventory', () => {
   if (!inventory.length) { notify('🎒 Inventory kosong.'); return; }
