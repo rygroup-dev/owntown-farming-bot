@@ -173,7 +173,10 @@ section{display:none}section.active{display:block}
     <div class="row"><span>Property</span><b id="t_prop">—</b></div>
     <div class="row"><span>Listed / Canceled</span><b id="t_lc">—</b></div></div>
   <div class="card"><h2>📊 Market prices</h2><div id="market" class="mono">—</div></div>
-  <div class="card" style="grid-column:1/-1"><h2>🧾 Transaksi terakhir</h2><div class="tw">
+  <div class="card" style="grid-column:1/-1"><h2>🏷️ Sedang dijual (listing aktif)</h2><div class="tw">
+    <table><thead><tr><th>Item</th><th>Qty</th><th>Harga</th></tr></thead>
+    <tbody id="listings"><tr><td colspan="3" style="color:var(--mut)">tidak ada listing aktif</td></tr></tbody></table></div></div>
+  <div class="card" style="grid-column:1/-1"><h2>🧾 Transaksi terakhir (terjual)</h2><div class="tw">
     <table><thead><tr><th>Waktu</th><th>Item</th><th>Qty</th><th>Harga</th><th>Total</th><th></th></tr></thead>
     <tbody id="trades"><tr><td colspan="6" style="color:var(--mut)">belum ada penjualan</td></tr></tbody></table></div></div>
  </div></section>
@@ -247,6 +250,7 @@ async function tick(){
   $('t_pvp').textContent='+'+fmt(d.pvpEarnings);$('t_prop').textContent='+'+fmt(d.propertyEarnings);
   $('t_lc').textContent=fmt(d.listed)+' / '+fmt(d.canceled);
   $('market').textContent=d.market||'(no data yet)';
+  $('listings').innerHTML=(d.listings&&d.listings.length)?d.listings.map(l=>'<tr><td>'+esc(l.name)+'</td><td>'+l.qty+'</td><td class="yel">'+fmt(l.price)+'</td></tr>').join(''):'<tr><td colspan="3" style="color:var(--mut)">tidak ada listing aktif</td></tr>';
   $('trades').innerHTML=(d.trades&&d.trades.length)?d.trades.map(t=>'<tr><td>'+new Date(t.t).toLocaleTimeString()+'</td><td>'+esc(t.name)+'</td><td>'+t.qty+'</td><td>'+fmt(t.price)+'</td><td class="grn">+'+fmt(t.total)+'</td><td><span class="tag '+(t.method==='quickSell'?'qs':'mkt')+'">'+(t.method==='quickSell'?'QS':'MKT')+'</span></td></tr>').join(''):'<tr><td colspan="6" style="color:var(--mut)">belum ada penjualan</td></tr>';
   // inventory
   $('i_count').textContent=d.invCount+' / '+d.carryCap;

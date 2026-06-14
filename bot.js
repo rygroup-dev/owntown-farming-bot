@@ -357,6 +357,7 @@ function getSellDecision(defId, qty) {
 // ---- trade history + pending-sale notifier ----
 let tradeLog = [];      // {t, defId, qty, method, price, total}
 let pendingSales = [];  // batched for Telegram digest
+let lastCreditAt = 0;   // dedup: explicit result credits vs toast echoes
 
 // ---- hourly profit tracking (for dashboard chart) ----
 let hourlyProfit = {}; // hourKey (epoch hours) -> OTWN earned that hour
@@ -388,6 +389,7 @@ function recordSale(defId, qty, method, price) {
   const rec = { t: Date.now(), defId, qty, method, price, total };
   tradeLog.push(rec); if (tradeLog.length > 120) tradeLog.shift();
   pendingSales.push(rec);
+  lastCreditAt = Date.now();
   log(`💰 ${method==='quickSell'?'QS':'MKT'} ${defId} x${qty} @${price} = ${total} OTWN`);
 }
 function cleanName(id) { return String(id).replace(/^(mat_|fish_|wpn_|tool_|cos_|food_|med_|kit_|pet_|permit_)/, '').replace(/_/g, ' '); }
@@ -1274,8 +1276,12 @@ async function startBot() {
   socket.on('toast', (d) => {
     if(d.kind === 'success') {
       const msg = (d.message || '').toLowerCase();
-      // NOTE: do NOT recordSale here — marketplace:result / sellAll:result already
-      // credit sales; recording on toast too would double-count income.
+      // Capture PASSIVE market sales (a buyer bought our listing) which only arrive via toast.
+      // Guard: skip if an explicit result credit fired in the last 3.5s (avoids double-count of sellAll/quicksell).
+      if((msg.includes('sold') || msg.includes('received')) && Date.now() - lastCreditAt > 3500) {
+        const m = d.message.match(/(\d[\d,]*)\s*\$?OTWN/);
+        if(m) { const amount = parseInt(m[1].replace(/,/g, '')); if(amount > 0) recordSale('market-sale', 1, 'marketplace', amount); }
+      }
       if(msg.includes('list')) stats.listed++;
       if(msg.includes('pvp') || msg.includes('arena')) {
         log(`⚔️ PvP toast: ${d.message}`);
@@ -1412,6 +1418,7 @@ function getSnapshot() {
     canceled: stats.canceled, listed: stats.listed, repaired: stats.repaired,
     inventory: inventory.map(i => ({ name: cleanName(i.defId), defId: i.defId, qty: i.qty, value: (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty })),
     trades: tradeLog.slice(-50).reverse().map(r => ({ t: r.t, name: cleanName(r.defId), qty: r.qty, method: r.method, price: r.price, total: r.total })),
+    listings: myActiveListings.map(l => ({ name: cleanName(l.defId), qty: l.qty || 1, price: l.price, total: l.price })),
     settings: {
       schedule: scheduleActive ? config.scheduleRaw : 'off',
       jitter: config.scheduleJitterPct,
