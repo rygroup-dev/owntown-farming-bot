@@ -7,6 +7,10 @@
 Full-featured automated farming bot for [Owntown.fun](https://owntown.fun) — a Solana-based MMO game.
 Mining · Fishing · Combat · PvP · Marketplace · Banking · Crafting — plus a **self-fix system** and full **Telegram** control + **web dashboard**.
 
+[![CI](https://github.com/rygroup-dev/owntown-farming-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/rygroup-dev/owntown-farming-bot/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/badge/node-%3E%3D18-43853d?logo=node.js&logoColor=white)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 </div>
 
 ## ⚡ One-line Install
