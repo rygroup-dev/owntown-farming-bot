@@ -41,7 +41,12 @@ let paused = false;
 let lastActivity = Date.now();        // updated on any meaningful game result
 let activeSocket = null;              // current live socket (for watchdog/commands)
 let lastCycleStart = Date.now();
+let retryTimer = null;                // single pending (re)connect timer
 function touchActivity() { lastActivity = Date.now(); }
+function scheduleStart(ms) {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
+}
 
 log('=== OWNTOWN PROFIT FARMER v23.0 ===');
 log('FULL FEATURED: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Sell');
@@ -839,7 +844,7 @@ function runNextCycle(sock) {
   if(stats.consecutiveErrors >= 10) {
     log(`⚠️ ${stats.consecutiveErrors} err — reconnect`);
     sock.disconnect();
-    setTimeout(startBot, 5000);
+    scheduleStart(5000);
     return;
   }
 
@@ -949,6 +954,10 @@ function startAction(sock, type) {
 // ============ MAIN BOT ============
 let fundingNotified = false;
 async function startBot() {
+  // single-socket guard: cancel pending retry + tear down any old socket
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  if (activeSocket) { try { activeSocket.removeAllListeners(); activeSocket.disconnect(); } catch (e) {} activeSocket = null; }
+  connected = false;
   inventoryReady = false;
   if(!token || isTokenExpired(token)) {
     try { token = await authenticate(); }
@@ -961,11 +970,11 @@ async function startBot() {
           fundingNotified = true;
           notify(`⛽ <b>Wallet needs funding</b>\nHold at least <b>${m[1]} $OTWN</b> to enter Player Mode.\nWallet: <code>${WALLET_ADDR}</code>\nI'll keep checking every 5 min and auto-start once funded.`);
         }
-        setTimeout(startBot, 300000); // slow 5-min retry while unfunded
+        scheduleStart(300000); // slow 5-min retry while unfunded
         return;
       }
       fundingNotified = false;
-      setTimeout(startBot, 30000);
+      scheduleStart(30000);
       return;
     }
     fundingNotified = false; // auth succeeded -> reset for next time
@@ -1248,11 +1257,10 @@ async function startBot() {
   });
 
   // === CONNECTION ===
-  let disconnectTimer = null;
   socket.on('connect', () => {
     connected = true;
     touchActivity();
-    if(disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
+    if(retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     log('Connected!');
     notify(`🟢 <b>Connected</b> to ${GAME_HOST}`);
     activeSocket = socket;
@@ -1282,7 +1290,7 @@ async function startBot() {
     log('Disconnected!');
     connected = false;
     notify(`🔴 <b>Disconnected</b> — auto-reconnect in 30s`);
-    disconnectTimer = setTimeout(() => { log('⚠️ Reconnecting...'); startBot(); }, 30000);
+    scheduleStart(30000);
   });
 
   socket.on('connect_error', (err) => {
@@ -1290,7 +1298,7 @@ async function startBot() {
       log('🔑 Token invalid, re-authenticating...');
       token = null;
       socket.disconnect();
-      setTimeout(startBot, 2000);
+      scheduleStart(2000);
     }
   });
 
@@ -1348,31 +1356,37 @@ setInterval(() => {
     if (activeSocket && activeSocket.connected) {
       try { runNextCycle(activeSocket); } catch (e) { log('🐶 cycle restart failed: ' + e.message); }
     } else {
-      try { if (activeSocket) activeSocket.disconnect(); } catch {}
-      setTimeout(startBot, 2000);
+      scheduleStart(2000);
     }
   }
   // 2) Fully disconnected for way too long -> hard reconnect
   if (!connected && idle > WATCHDOG_STUCK_MS * 2) {
     log(`🐶 WATCHDOG: offline too long — hard restart`);
     touchActivity();
-    setTimeout(startBot, 2000);
+    scheduleStart(2000);
   }
 }, 60000);
 
 // ============ TELEGRAM COMMANDS ============
 tg.on('help', () => notify([
   '<b>Owntown Bot — commands</b>',
+  '/start — connect + start farming now',
   '/status — live stats summary',
   '/balance — balance + bank',
   '/log [n] — last n log lines (default 15)',
   '/pause — pause farming (stays connected)',
   '/resume — resume farming',
   '/restart — restart the process (systemd relaunches)',
+  '/update — pull latest code from git + restart',
   '/reauth — force re-authentication',
   '/help — this message',
 ].join('\n')));
-tg.on('start', () => notify('👋 Bot is running. /help for commands.'));
+tg.on('start', () => {
+  paused = false;
+  if (connected) { notify('▶️ Already farming. /status for stats.'); return; }
+  notify('🚀 Connecting + starting farming now...');
+  startBot();
+});
 tg.on('status', () => notify(buildStatusText()));
 tg.on('stats', () => notify(buildStatusText()));
 tg.on('balance', () => notify(`💰 Balance: <b>${balance.toFixed(2)}</b> OTWN\n🏦 Bank withdrawable: ${stats.bankBalance}\n📅 Daily earned: ${dailyEarned}/${DAILY_EARN_CAP}`));
@@ -1393,6 +1407,13 @@ tg.on('reauth', () => {
   setTimeout(startBot, 1500);
 });
 tg.on('restart', () => { notify('♻️ Restarting process...'); setTimeout(() => process.exit(0), 800); });
+tg.on('update', () => {
+  notify('⬇️ Pulling latest code from git...');
+  require('child_process').exec('git -C ' + __dirname + ' pull --ff-only 2>&1', (err, out) => {
+    notify('<pre>' + String(out || err).slice(0, 600).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>');
+    if (!err) { notify('♻️ Restarting with new code...'); setTimeout(() => process.exit(0), 1000); }
+  });
+});
 
 // ============ CRASH RECOVERY ============
 process.on('uncaughtException', (err) => {
