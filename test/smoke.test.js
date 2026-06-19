@@ -23,7 +23,7 @@ test('main source files pass node syntax check', () => {
 test('package metadata matches project identity', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   assert.equal(pkg.name, 'owntown-farmer');
-  assert.equal(pkg.version, '30.0.0');
+  assert.equal(pkg.version, '32.0.0');
 });
 
 test('telegram command handlers match documented command surface', () => {

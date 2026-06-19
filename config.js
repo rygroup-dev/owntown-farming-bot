@@ -74,6 +74,13 @@ const config = {
   // Auto-powerup: buy items that help leveling/sustained farming
   powerupEnabled: (process.env.POWERUP_ENABLED || 'true').toLowerCase() === 'true',
   watchdogStuckMin: parseInt(process.env.WATCHDOG_STUCK_MIN || '5', 10),
+
+  // Anti-detection micro-breaks (short idle pauses between cycles)
+  microbreakEnabled: (process.env.MICROBREAK_ENABLED || 'true').toLowerCase() === 'true',
+  microbreakMinSec: parseInt(process.env.MICROBREAK_MIN_SEC || '30', 10),
+  microbreakMaxSec: parseInt(process.env.MICROBREAK_MAX_SEC || '180', 10),
+  microbreakEveryMin: parseInt(process.env.MICROBREAK_EVERY_MIN || '6', 10),
+  microbreakEveryMax: parseInt(process.env.MICROBREAK_EVERY_MAX || '14', 10),
   logPath: process.env.LOG_PATH || '/tmp/owntown_v30.log',
   tokenPath: process.env.TOKEN_PATH || '/tmp/owntown_token.txt',
 };

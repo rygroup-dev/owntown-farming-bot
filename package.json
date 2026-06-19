@@ -1,6 +1,6 @@
 {
   "name": "owntown-farmer",
-  "version": "30.0.0",
+  "version": "32.0.0",
   "description": "Full-featured automated farming bot for Owntown.fun — mining, fishing, combat, PvP, property, marketplace, bank, crafting",
   "main": "bot.js",
   "scripts": {

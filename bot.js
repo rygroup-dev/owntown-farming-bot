@@ -7,8 +7,14 @@ const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
 const path = require('path');
 const { execFile } = require('child_process');
-const { buildSellDecision, getMarketDepth, getPriceTrend } = require('./lib/market');
+const { buildSellDecision, getMarketDepth, getPriceTrend, sellTiming } = require('./lib/market');
 const { parseSchedule } = require('./lib/schedule');
+const { distance, inRange } = require('./lib/movement');
+const { nextBreakAfter, isBreakDue, breakDurationMs } = require('./lib/microbreak');
+const { pickActivity } = require('./lib/rotation');
+const { pickTarget } = require('./lib/combat');
+const { activityWeights } = require('./lib/orchestrator');
+const { questActionFor } = require('./lib/quest');
 const pkg = require('./package.json');
 
 // ============ CONFIG ============
@@ -64,9 +70,13 @@ let lastDisconnectAt = 0;
 let lastDisconnectReason = 'none';
 let pauseReason = '';
 function touchActivity() { lastActivity = Date.now(); }
+let reconnectAttempts = 0;
+let microbreakState = { dueAtCycle: nextBreakAfter({ everyMin: config.microbreakEveryMin, everyMax: config.microbreakEveryMax }) };
 function scheduleStart(ms) {
   if (retryTimer) clearTimeout(retryTimer);
   nextRetryAt = Date.now() + Math.max(0, ms || 0);
+  reconnectAttempts++;
+  log(`🔁 reconnect attempt #${reconnectAttempts} in ${Math.round((ms||0)/1000)}s`);
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
@@ -97,6 +107,8 @@ let DAILY_EARN_CAP = 0;
 let CARRY_CAP = 44;
 const MARKET_INTERVAL = 3500;
 const LOW_DURABILITY = 30;
+const MINING_RANGE = 6; // emit mining:start only within this many units of node
+const COMBAT_RANGE = 8; // emit combat:attack only within this many units of mob
 const FISHING_TIMEOUT = 120000;
 let REST_TIMEOUT = 20000;
 let AUTH_TIMEOUT = 20000;
@@ -149,6 +161,9 @@ const MINING_NODES = [
   { id: 'node_dw_5', pos: {x:110,z:-145} },{ id: 'node_dw_6', pos: {x:80,z:-155} },
   { id: 'node_dw_7', pos: {x:150,z:-150} },{ id: 'node_dw_8', pos: {x:135,z:-165} },
 ];
+
+const MINING_ITEMS = ['mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber','mat_resonance_core'];
+const FISHING_ITEMS = ['fish_sun_carp','fish_moon_koi','fish_void_angler','fish_abyssal_lantern','fish_golden_koi','fish_silver_darter'];
 
 const ZONE_TARGETS = {
   deepworks:{x:75,z:-95}, pond:{x:-148.5,z:0}, redline_a:{x:-100,z:-120},
@@ -243,11 +258,15 @@ function decideNextAction(){
   if(qn==='mining')return'mining';
   if(qn==='fishing')return'fishing';
   if(qn==='combat')return'combat';
-  const order=['sell','mining','fishing','combat','mining','fishing','mining','combat'];
-  let action=order[stats.cycles%order.length];
-  // Skip sell rotation when nothing to sell — advance to next activity
-  if(action==='sell'&&!inventory.some(isSellable))action=order[(stats.cycles+1)%order.length];
-  return action;
+  // Weighted-random rotation (non-deterministic to avoid a periodic signature),
+  // with adaptive weights that favour the activity whose items are priced highest.
+  const eligible=[];
+  if(inventory.some(isSellable))eligible.push('sell');
+  eligible.push('mining','fishing');
+  if(liveMonsters.some(m=>m.alive))eligible.push('combat');
+  const adaptive=activityWeights({ marketPrices, base:{ mining:3, fishing:2 }, miningItems:MINING_ITEMS, fishingItems:FISHING_ITEMS, highPrice:10 });
+  const weights={ sell:2, mining:adaptive.mining, fishing:adaptive.fishing, combat:2 };
+  return pickActivity({ eligible, weights }) || 'mining';
 }
 
 // ============ QUEST AUTO-PROGRESS ============
@@ -264,8 +283,7 @@ let questSellAttempts = 0;
 const QUEST_SELL_MAX_ATTEMPTS = 5;
 
 function questNeedsAction(){
-  if(!questState||!questState.activeId)return null;
-  const need = QUEST_NEEDS[questState.activeId]||null;
+  const need = questActionFor(questState, QUEST_NEEDS);
   if(need === 'sell' && questSellAttempts >= QUEST_SELL_MAX_ATTEMPTS) return null;
   return need;
 }
@@ -298,7 +316,7 @@ function tryProgressQuest(sock){
 
   sock.emit('quest:action',{type:'check'});
 }
-function getAliveMonster(){if(liveMonsters.length>0){const alive=liveMonsters.filter(m=>m.alive);if(alive.length>0)return alive[stats.currentMonsterIdx%alive.length]}return{id:'mon_1',pos:{x:-100,z:-120}}}
+function getAliveMonster(){const t=pickTarget({monsters:liveMonsters,pos});return t||{id:'mon_1',pos:{x:-100,z:-120}}}
 
 // ============ CRAFTING / FOOD / HEAL ============
 function tryCraft(sock){for(const[id,r]of Object.entries(GEAR_RECIPES)){let ok=true;for(const[m,q]of Object.entries(r.needs))if(!inventory.find(i=>i.defId===m&&i.qty>=q)){ok=false;break}if(ok&&balance>=r.fee){sock.emit('inventory:craft',{recipeId:id});stats.crafted++;log(`🔨 Craft ${id}`);return true}}return false}
@@ -335,11 +353,11 @@ function doSellPhase(sock,cb){
   const sellable=inventory.filter(isSellable);
   if(!sellable.length){log('💰 Nothing to sell (all kept/held)');cb();return}
   tryCraft(sock);log(`💰 SELL ${sellable.length} sellable / ${inventory.length} total`);const old=[...myActiveListings];function cancelNext(i){if(i>=old.length){freshSell(sock,cb);return}sock.emit('marketplace:cancel',{listingId:old[i].id});stats.canceled++;setTimeout(()=>cancelNext(i+1),1500)}if(old.length>0)cancelNext(0);else freshSell(sock,cb)}
-function freshSell(sock,cb){const toM=[],toQ=[],toH=[];for(const item of inventory){if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')continue;const d=getSellDecision(item.defId,item.qty);if(d.action==='HOLD'){toH.push({defId:item.defId,qty:item.qty,reason:d.reason});stats.holdCount++}else if(d.action==='MARKETPLACE')toM.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty,price:d.price,marketBest:d.marketBest});else toQ.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty})}log(`📊 MKT:${toM.length} QS:${toQ.length} HOLD:${toH.length}`);for(const m of toM)log(`  📋 ${m.defId} x${m.qty} → MKT @${m.price} (best:${m.marketBest})`);for(const h of toH)log(`  🛡️ ${h.defId} x${h.qty} → HOLD (${h.reason})`);for(const q of toQ)log(`  💸 ${q.defId} x${q.qty} → QS`);function listNext(i){if(i>=toM.length||!connected){if(toQ.length)quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000);return}const m=toM[i];sock.emit('marketplace:list',{instanceId:m.instanceId,qty:m.qty,price:m.price});log(`📋 ${m.defId} x${m.qty} @${m.price}`);setTimeout(()=>listNext(i+1),MARKET_INTERVAL)}if(toM.length>0)listNext(0);else if(toQ.length){quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000)}else cb()}
+function freshSell(sock,cb){const toM=[],toQ=[],toH=[];for(const item of inventory){if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')continue;const d=getSellDecision(item.defId,item.qty);if(d.action==='HOLD'){toH.push({defId:item.defId,qty:item.qty,reason:d.reason});stats.holdCount++}else if(d.action==='MARKETPLACE'){const timing=sellTiming({trend:d.trend,depth:d.depth});if(timing.hold&&inventory.length<CARRY_CAP-6){toH.push({defId:item.defId,qty:item.qty,reason:timing.reason});stats.holdCount++}else toM.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty,price:d.price,marketBest:d.marketBest})}else toQ.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty})}log(`📊 MKT:${toM.length} QS:${toQ.length} HOLD:${toH.length}`);for(const m of toM)log(`  📋 ${m.defId} x${m.qty} → MKT @${m.price} (best:${m.marketBest})`);for(const h of toH)log(`  🛡️ ${h.defId} x${h.qty} → HOLD (${h.reason})`);for(const q of toQ)log(`  💸 ${q.defId} x${q.qty} → QS`);function listNext(i){if(i>=toM.length||!connected){if(toQ.length)quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000);return}const m=toM[i];sock.emit('marketplace:list',{instanceId:m.instanceId,qty:m.qty,price:m.price});log(`📋 ${m.defId} x${m.qty} @${m.price}`);setTimeout(()=>listNext(i+1),MARKET_INTERVAL)}if(toM.length>0)listNext(0);else if(toQ.length){quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000)}else cb()}
 function quickSellSafe(sock,items){for(const it of items){if(!SAFE_QUICKSELL.has(it.defId)||!it.instanceId)continue;sock.emit('marketplace:quickSell',{instanceId:it.instanceId,qty:it.qty||1})}}
 
 // ============ ACTIONS ============
-function doActions(sock,type){if(!connected)return;currentActivity=type;const cfg=ACTIONS[type];let count=0,lastCatch=Date.now();const mon=getAliveMonster();const node=MINING_NODES[stats.currentNodeIdx%MINING_NODES.length];const jitteredInterval=cfg.interval+Math.floor(Math.random()*800)-200;log(`▶ ${type} (max ${cfg.count})`);const iv=setInterval(()=>{if(!connected){clearInterval(iv);return}if(stats.consecutiveErrors>=5){clearInterval(iv);stats.consecutiveErrors=0;setTimeout(()=>runNextCycle(sock),2000);return}if(hp<LOW_HP)tryEatFood(sock);if(type==='fishing'&&fishingActive&&Date.now()-lastCatch>FISHING_TIMEOUT){clearInterval(iv);fishingActive=false;stats.fishingTimeouts++;setTimeout(()=>runNextCycle(sock),2000);return}if(count>=cfg.count){clearInterval(iv);if(type==='mining')stats.currentNodeIdx=(stats.currentNodeIdx+1)%MINING_NODES.length;if(type==='combat')stats.currentMonsterIdx=(stats.currentMonsterIdx+1)%Math.max(1,liveMonsters.length);setTimeout(()=>runNextCycle(sock),2000+Math.floor(Math.random()*2000));return}if(type==='mining'){sock.emit('mining:start',{nodeId:node.id});count++}else if(type==='fishing'){if(!fishingActive){sock.emit('fishing:cast',{spotId:'fish_dock'});lastCatch=Date.now();count++}}else if(type==='combat'){sock.emit('combat:attack',{monsterId:mon.id});count++}else if(type==='pvp'){sock.emit('pvp:attack');stats.pvpFights++;count++}},jitteredInterval)}
+function doActions(sock,type){if(!connected)return;currentActivity=type;const cfg=ACTIONS[type];let count=0,lastCatch=Date.now();const mon=getAliveMonster();const node=MINING_NODES[stats.currentNodeIdx%MINING_NODES.length];const jitteredInterval=cfg.interval+Math.floor(Math.random()*800)-200;log(`▶ ${type} (max ${cfg.count})`);const iv=setInterval(()=>{if(!connected){clearInterval(iv);return}if(stats.consecutiveErrors>=5){clearInterval(iv);stats.consecutiveErrors=0;setTimeout(()=>runNextCycle(sock),2000);return}if(hp<LOW_HP)tryEatFood(sock);if(type==='fishing'&&fishingActive&&Date.now()-lastCatch>FISHING_TIMEOUT){clearInterval(iv);fishingActive=false;stats.fishingTimeouts++;setTimeout(()=>runNextCycle(sock),2000);return}if(count>=cfg.count){clearInterval(iv);if(type==='mining')stats.currentNodeIdx=(stats.currentNodeIdx+1)%MINING_NODES.length;if(type==='combat')stats.currentMonsterIdx=(stats.currentMonsterIdx+1)%Math.max(1,liveMonsters.length);setTimeout(()=>runNextCycle(sock),2000+Math.floor(Math.random()*2000));return}if(type==='mining'){if(!inRange(pos,node.pos,MINING_RANGE)){clearInterval(iv);walkDirect(sock,node.pos,()=>{if(connected)doActions(sock,'mining')});return}sock.emit('mining:start',{nodeId:node.id});count++}else if(type==='fishing'){if(!fishingActive){sock.emit('fishing:cast',{spotId:'fish_dock'});lastCatch=Date.now();count++}}else if(type==='combat'){if(mon.pos&&!inRange(pos,mon.pos,COMBAT_RANGE)){clearInterval(iv);walkDirect(sock,mon.pos,()=>{if(connected)doActions(sock,'combat')});return}sock.emit('combat:attack',{monsterId:mon.id});count++}else if(type==='pvp'){sock.emit('pvp:attack');stats.pvpFights++;count++}},jitteredInterval)}
 
 // ============ CYCLE ============
 function runNextCycle(sock){
@@ -349,6 +367,14 @@ function runNextCycle(sock){
   if(stamina<LOW_STAMINA)tryEatFood(sock);
   if(worldBossState&&worldBossState.phase==='active'&&level>=(worldBossState.minLevel||10)&&!stats.worldBossActive){stats.worldBossActive=true;sock.emit('worldboss:enter');notify(`👹 <b>World Boss!</b> Entering`)}
   stats.cycles++;stats.consecutiveErrors=0;
+  if(config.microbreakEnabled && isBreakDue(microbreakState, stats.cycles)){
+    const ms = breakDurationMs({ minSec: config.microbreakMinSec, maxSec: config.microbreakMaxSec });
+    microbreakState = { dueAtCycle: stats.cycles + nextBreakAfter({ everyMin: config.microbreakEveryMin, everyMax: config.microbreakEveryMax }) };
+    log(`😴 micro-break ${Math.round(ms/1000)}s (next at cycle ${microbreakState.dueAtCycle})`);
+    touchActivity();
+    setTimeout(()=>{ if(connected) runNextCycle(sock); }, ms);
+    return;
+  }
   const type=decideNextAction();
   log(`\n=== Cycle ${stats.cycles}: ${type.toUpperCase()} ===`);
   if(type==='heal'){walkDirect(sock,ZONE_TARGETS.clinic,()=>{tryClinicHeal(sock);setTimeout(()=>runNextCycle(sock),2000)});return}
@@ -398,7 +424,9 @@ async function startBot(){
     }
     fundingNotified=false;
   }
-  const socket=io('https://'+GAME_HOST,{auth:{token},transports:['polling'],upgrade:false,reconnection:false});
+  // Let socket.io use its default transport set (polling→websocket upgrade),
+  // matching a normal browser client; we still drive reconnection ourselves.
+  const socket=io('https://'+GAME_HOST,{auth:{token},reconnection:false});
 
   socket.on('player:correction',(d)=>{if(d.pos){pos.x=d.pos.x;pos.z=d.pos.z}});
   socket.on('player:state',(d)=>{
@@ -491,7 +519,7 @@ async function startBot(){
   socket.on('notifications',(d)=>{if(d.items)stats.notifications=d.items.length});
 
   socket.on('connect',()=>{
-    connected=true;touchActivity();pauseReason='';nextRetryAt=0;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
+    connected=true;reconnectAttempts=0;touchActivity();pauseReason='';nextRetryAt=0;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
     log('Connected!');notify(`🟢 <b>Connected</b> — ${GAME_HOST}`);activeSocket=socket;
     let started=false;
     socket.on('player:correction',function onC(d){if(!started&&d.pos){pos.x=d.pos.x;pos.z=d.pos.z;started=true;socket.removeListener('player:correction',onC);log(`Pos:(${pos.x.toFixed(1)},${pos.z.toFixed(1)}) ${zoneName}`);waitInv(socket,()=>{socket.emit('economy:ledger');checkBank(token);socket.emit('property:info',{});socket.emit('candy:claim');runNextCycle(socket)})}});
@@ -520,6 +548,18 @@ setInterval(()=>{if(!pendingSales.length)return;const count=pendingSales.reduce(
 // ============ WATCHDOG ============
 const WD_MS=Math.max(2,config.watchdogStuckMin)*60000;
 setInterval(()=>{if(paused||stopped)return;const idle=Date.now()-lastActivity;if(connected&&idle>WD_MS){log('🐶 WATCHDOG');touchActivity();if(activeSocket&&activeSocket.connected)try{runNextCycle(activeSocket)}catch{}else scheduleStart(2000)}if(!connected&&idle>WD_MS*2){touchActivity();scheduleStart(2000)}},60000);
+
+// ============ RECONNECT SUPERVISOR ============
+// Guarantees a reconnect is always armed when we should be online but aren't.
+function shouldBeOnline(){ return !stopped && !paused; }
+setInterval(()=>{
+  if(!shouldBeOnline())return;
+  if(connected)return;
+  if(retryTimer)return;            // a retry is already armed
+  if(maintenanceInFlight)return;   // restart/update in progress
+  log('🛟 supervisor: no connection and no pending retry — re-arming');
+  scheduleStart(2000);
+},60000);
 
 // ============ TELEGRAM COMMANDS ============
 tg.on('help',()=>notify([
