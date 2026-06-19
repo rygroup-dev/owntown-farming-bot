@@ -35,7 +35,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-
 ### Pinned release install
 
 ```bash
-OWNTOWN_REF=v30.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+OWNTOWN_REF=v32.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
 ### Manual install
@@ -103,6 +103,32 @@ npm test
 The test suite covers syntax checks, Telegram command registration, market decision logic, and schedule parsing.
 
 ## Release Notes
+
+- `v32.0.0`
+  - Smarter combat (closest-alive targeting, walk-into-range) — fixes the 0-kills case.
+  - Market sell-timing: briefly hold sellable items on rising, thin markets.
+  - Adaptive activity weights driven by live market prices.
+  - Keyword-inferred quest action so new quests work without code changes.
+- `v31.0.0`
+  - Reconnect supervisor guarantees the reconnect chain always re-arms (no more silent idle).
+  - Mining/combat re-walk into range instead of spamming the action emit (fixes OUT_OF_RANGE bursts).
+  - Anti-detection: randomized idle micro-breaks + weighted-random activity rotation.
+  - Transport now allows the default polling→websocket upgrade to match a normal client.
+
+### Upgrading from an older version (e.g. v25 → v32)
+
+No new dependencies and all new settings have safe defaults, so upgrading is a pull + restart:
+
+```bash
+# Re-run the one-liner (it fetches, checks out latest main, npm installs, restarts the service):
+bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+# …or, if already installed, from Telegram just send:  /update
+# …or manually:
+cd ~/owntown-farming-bot && git pull --ff-only origin main && npm install --omit=dev && systemctl restart owntown-bot.service
+```
+
+Your `.env` is preserved (it is gitignored). Optional new knobs: `MICROBREAK_ENABLED`,
+`MICROBREAK_MIN_SEC`, `MICROBREAK_MAX_SEC`, `MICROBREAK_EVERY_MIN`, `MICROBREAK_EVERY_MAX`.
 
 - `v25.0.3`
   - Sync pinned installer/tag/docs with the latest upstream fixes.
