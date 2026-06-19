@@ -244,40 +244,29 @@ function questNeedsAction(){
   return need;
 }
 
+// tryProgressQuest: called sparingly (every ~10 cycles) to nudge stuck quests.
+// Does NOT walk — assumes caller already positioned or will handle location.
 function tryProgressQuest(sock){
-  if(!questState||!questState.activeId)return;
+  if(!connected||!questState||!questState.activeId)return;
   const q=questState.activeId;
 
   if(q==='sell_your_first_haul'){
     questSellAttempts++;
-    walkDirect(sock,ZONE_TARGETS.market,()=>{
-      sock.emit('quest:action',{type:'interact'});
-      sock.emit('quest:action',{type:'check'});
-      const item=inventory.find(i=>!KEEP.has(i.defId)&&i.qty>0&&i.status!=='locked');
-      if(item){
-        // Use sell decision engine: respect floor prices + live market
-        const d=getSellDecision(item.defId,item.qty);
-        let price;
-        if(d.action==='MARKETPLACE'&&d.price>0) price=d.price;
-        else {
-          const live=marketPrices[item.defId];
-          const floor=PRICE_FLOOR[item.defId]||0;
-          price=Math.max(1,Math.round((live||floor||QUICKSELL[item.defId]||5)*0.92));
-        }
-        sock.emit('marketplace:list',{instanceId:item.instanceId,qty:1,price});
-        log(`📜 Quest sell: list ${item.defId} x1 @${price} (floor:${PRICE_FLOOR[item.defId]||'-'} live:${marketPrices[item.defId]||'-'}) attempt ${questSellAttempts}/${QUEST_SELL_MAX_ATTEMPTS}`);
-        setTimeout(()=>{
-          sock.emit('quest:action',{type:'check'});
-          // Also try quicksell as fallback
-          const qs=inventory.find(i=>SAFE_QUICKSELL.has(i.defId)&&i.qty>0);
-          if(qs){
-            sock.emit('marketplace:quickSell',{instanceId:qs.instanceId,qty:1});
-            log(`📜 Quest sell: also quickSell ${qs.defId} x1`);
-          }
-          setTimeout(()=>sock.emit('quest:action',{type:'check'}),2000);
-        },2000);
+    if(questSellAttempts>QUEST_SELL_MAX_ATTEMPTS)return;
+    // List one item on marketplace (quest may require listing, not NPC sell)
+    const item=inventory.find(i=>!KEEP.has(i.defId)&&i.qty>0&&i.status!=='locked');
+    if(item){
+      const d=getSellDecision(item.defId,item.qty);
+      let price;
+      if(d.action==='MARKETPLACE'&&d.price>0) price=d.price;
+      else {
+        const live=marketPrices[item.defId];
+        const floor=PRICE_FLOOR[item.defId]||0;
+        price=Math.max(1,Math.round((live||floor||QUICKSELL[item.defId]||5)*0.92));
       }
-    });
+      sock.emit('marketplace:list',{instanceId:item.instanceId,qty:1,price});
+      log(`📜 Quest: list ${item.defId} x1 @${price} (floor:${PRICE_FLOOR[item.defId]||'-'} live:${marketPrices[item.defId]||'-'}) attempt ${questSellAttempts}/${QUEST_SELL_MAX_ATTEMPTS}`);
+    }
     return;
   }
 
@@ -341,12 +330,15 @@ function runNextCycle(sock){
   if(type==='sell'){
     sock.emit('economy:ledger');
     walkDirect(sock,ZONE_TARGETS.market,()=>{
-      sock.emit('quest:action',{type:'interact'});
-      sock.emit('quest:action',{type:'check'});
+      if(!connected)return;
       doSellPhase(sock,()=>{
-        sock.emit('quest:action',{type:'check'});
-        tryProgressQuest(sock);
-        setTimeout(()=>runNextCycle(sock),1500);
+        if(!connected)return;
+        // Nudge quest every 10 cycles (gentle, no extra walk)
+        const doQuest=questState&&questState.activeId&&stats.cycles%10===0;
+        setTimeout(()=>{
+          if(doQuest)tryProgressQuest(sock);
+          setTimeout(()=>runNextCycle(sock),doQuest?3000:1500);
+        },1500);
       });
     });
     return;
