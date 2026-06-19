@@ -47,6 +47,12 @@ README.md
 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
+Pinned stable release:
+
+```bash
+OWNTOWN_REF=v25.0.1 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+```
+
 ### Manual
 
 ```bash
@@ -133,6 +139,7 @@ Total command handler aktif: **30**
 Repo ini sekarang punya smoke test dasar untuk:
 - syntax check file utama
 - validasi command Telegram utama terdaftar
+- validasi decision logic market + parser schedule
 
 Jalankan:
 

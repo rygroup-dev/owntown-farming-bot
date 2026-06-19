@@ -1,6 +1,6 @@
 {
   "name": "owntown-farmer",
-  "version": "25.0.0",
+  "version": "25.0.1",
   "description": "Full-featured automated farming bot for Owntown.fun — mining, fishing, combat, PvP, property, marketplace, bank, crafting",
   "main": "bot.js",
   "scripts": {
@@ -12,6 +12,14 @@
     "tweetnacl": "^1.0.3",
     "bs58": "^5.0.0"
   },
-  "keywords": ["owntown", "solana", "bot", "farming", "mmo", "pvp", "marketplace"],
+  "keywords": [
+    "owntown",
+    "solana",
+    "bot",
+    "farming",
+    "mmo",
+    "pvp",
+    "marketplace"
+  ],
   "license": "MIT"
 }

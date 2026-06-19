@@ -3,6 +3,7 @@
 #  RY GROUP — Owntown Farming Bot — One-line Installer
 #  Usage (one-liner):
 #    bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+#    OWNTOWN_REF=v25.0.1 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 #  Non-interactive (pass secrets up front):
 #    WALLET_PRIVATE_KEY=xxx TELEGRAM_BOT_TOKEN=yyy bash <(curl -fsSL .../install.sh)
 # ============================================================
@@ -10,6 +11,7 @@ set -euo pipefail
 
 REPO="${OWNTOWN_REPO:-https://github.com/rygroup-dev/owntown-farming-bot.git}"
 DIR="${OWNTOWN_DIR:-$HOME/owntown-farming-bot}"
+REF="${OWNTOWN_REF:-main}"
 
 c_grn=$'\e[32m'; c_cyn=$'\e[36m'; c_yel=$'\e[33m'; c_red=$'\e[31m'; c_rst=$'\e[0m'
 say()  { printf '%s\n' "$*"; }
@@ -47,12 +49,23 @@ ok "node $(node -v) · git $(git --version | awk '{print $3}')"
 # ── 2. clone or update ──────────────────────────────────────
 if [ -d "$DIR/.git" ]; then
   info "Updating existing install at $DIR"
-  git -C "$DIR" pull --ff-only || warn "could not fast-forward; keeping local copy"
+  git -C "$DIR" fetch origin --tags
 else
   info "Cloning into $DIR"
   git clone --depth 1 "$REPO" "$DIR"
 fi
 cd "$DIR"
+if git rev-parse --verify "$REF^{commit}" >/dev/null 2>&1; then
+  git checkout --quiet "$REF"
+elif git fetch origin "$REF" --depth 1 >/dev/null 2>&1; then
+  git checkout --quiet FETCH_HEAD
+else
+  die "ref '$REF' not found on remote"
+fi
+if ! git pull --ff-only origin "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" >/dev/null 2>&1; then
+  warn "ref $REF checked out as-is (tag/detached or no fast-forward pull available)"
+fi
+ok "checked out ref: $(git rev-parse --short HEAD) (${REF})"
 
 # ── 3. install deps ─────────────────────────────────────────
 info "Installing dependencies…"
@@ -126,7 +139,7 @@ ${c_grn}════════════════════════
  ${c_grn}RY GROUP — Owntown Bot is live!${c_rst}
   • Telegram  : open your bot and send  /start   (learns your chat id)
   • Dashboard : all via Telegram — /status /balance /income /market /quest /candy
-  • Commands  : /help for full list (28 commands)
+  • Commands  : /help for full list (30 commands)
   • Fund your wallet with >= 5000 OTWN to enter Player Mode.
 ${c_grn}════════════════════════════════════════════════════════${c_rst}
 DONE

@@ -6,6 +6,9 @@ const bs58 = require('bs58').default || require('bs58');
 const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
 const path = require('path');
+const { execFile } = require('child_process');
+const { buildSellDecision, getMarketDepth, getPriceTrend } = require('./lib/market');
+const { parseSchedule } = require('./lib/schedule');
 
 // ============ CONFIG ============
 const TOKEN_PATH = config.tokenPath;
@@ -51,13 +54,14 @@ let lastActivity = Date.now();
 let activeSocket = null;
 let lastCycleStart = Date.now();
 let retryTimer = null;
+let maintenanceInFlight = false;
 function touchActivity() { lastActivity = Date.now(); }
 function scheduleStart(ms) {
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
-log('=== OWNTOWN SMART FARMER v25.0 ===');
+log('=== OWNTOWN SMART FARMER v25.0.1 ===');
 log('AUTO ORCHESTRATOR: Mining+Fishing+Combat+PvP+Quest+Candy+Market+Bank+Crafting');
 
 // ============ CONSTANTS ============
@@ -181,40 +185,15 @@ let token=getToken();
 
 // ============ MARKET INTELLIGENCE ============
 function scanMarketPrices(listings){const best={},counts={};for(const l of listings){if(l.status!=='active')continue;const ppu=l.price/(l.qty||1);if(!best[l.defId]||ppu<best[l.defId])best[l.defId]=ppu;counts[l.defId]=(counts[l.defId]||0)+1;}marketPrices=best;marketHistory.push({time:Date.now(),prices:{...best},counts:{...counts}});if(marketHistory.length>100)marketHistory.shift();for(const[defId,price]of Object.entries(best)){if(!stats.avgPrices[defId]){stats.avgPrices[defId]=price;stats.priceSamples[defId]=1}else{stats.priceSamples[defId]++;stats.avgPrices[defId]=stats.avgPrices[defId]*0.9+price*0.1;}}}
-function getMarketDepth(defId){const l=marketHistory[marketHistory.length-1];return l?(l.counts[defId]||0):0}
-function getPriceTrend(defId){if(marketHistory.length<3)return'stable';const r=marketHistory.slice(-3).map(h=>h.prices[defId]).filter(Boolean);if(r.length<2)return'stable';const avg=r.reduce((a,b)=>a+b,0)/r.length;const c=(r[r.length-1]-avg)/avg;return c>0.1?'rising':c<-0.1?'falling':'stable'}
+function getDepthFor(defId){return getMarketDepth(marketHistory,defId)}
+function getTrendFor(defId){return getPriceTrend(marketHistory,defId)}
 function getSellDecision(defId,qty){
-  const floor=PRICE_FLOOR[defId]||0;
-  const qsPrice=QUICKSELL[defId]||0;
-  const mktPrice=marketPrices[defId];
-  const depth=getMarketDepth(defId);
-  const trend=getPriceTrend(defId);
-
-  // Valuable items (marketplace-only): always try marketplace, hold if no good price
-  if(MARKETPLACE_ONLY.has(defId)){
-    if(mktPrice&&mktPrice>=floor){
-      const undercut=Math.max(floor,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10);
-      return{action:'MARKETPLACE',price:undercut,marketBest:mktPrice,depth,trend};
-    }
-    // No market data or price too low — hold, don't dump
-    return{action:'HOLD',reason:`valuable (floor ${floor})`,floor};
-  }
-
-  // Cheap bulk mats — only these get quicksold (terminal NPC sell)
-  if(SAFE_QUICKSELL.has(defId)){
-    // But if market price is way higher than QS, list on marketplace instead
-    if(mktPrice&&mktPrice>0.5){
-      return{action:'MARKETPLACE',price:Math.max(floor||0.1,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10),marketBest:mktPrice,depth,trend};
-    }
-    return{action:'QUICKSELL',price:qsPrice};
-  }
-
-  // Unknown items: if we see a market price, list there; otherwise hold (never QS unknowns)
-  if(mktPrice&&mktPrice>0.1){
-    return{action:'MARKETPLACE',price:Math.max(0.1,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10),marketBest:mktPrice,depth,trend};
-  }
-  if(floor>0)return{action:'HOLD',reason:'no market data, has value',floor};
-  return{action:'QUICKSELL',price:qsPrice||1};
+  return buildSellDecision({
+    defId, qty, marketPrices, marketHistory,
+    priceFloor: PRICE_FLOOR, quicksell: QUICKSELL,
+    marketplaceOnly: MARKETPLACE_ONLY, safeQuicksell: SAFE_QUICKSELL,
+    undercutPct: UNDERCUT_PCT,
+  });
 }
 
 // ============ PROFIT TRACKING ============
@@ -654,7 +633,7 @@ tg.on('candy',async()=>{try{const h=await apiGet('/api/health');const e=h.data?.
 tg.on('boss',()=>{if(!worldBossState){notify('👹 No data.');return}const next=worldBossState.nextSpawnAt?new Date(worldBossState.nextSpawnAt).toISOString().slice(11,16):'?';notify(`👹 <b>World Boss</b>\nPhase: <b>${worldBossState.phase}</b>\nHP: ${worldBossState.hp||0}/${worldBossState.maxHp||500000}\nNext: ${next} UTC\nMin Lv: ${worldBossState.minLevel||10}\nClaims: ${stats.bossClaims}`)});
 tg.on('world',()=>{const zones={};for(const p of livePlayers)zones[p.zone]=(zones[p.zone]||0)+1;const zl=Object.entries(zones).sort((a,b)=>b[1]-a[1]).map(([z,c])=>`${z}:${c}`).join(' ');const alive=liveMonsters.filter(m=>m.alive);const ml=alive.map(m=>`${m.name||m.defId} Lv${m.level} ${m.hp}/${m.maxHp}`).join('\n')||'none';notify(`🌍 <b>World</b>\nPlayers: <b>${serverPlayerCount}</b>\nZones: ${zl||'?'}\nBoss: ${worldBossState?.phase||'?'}\n\n<b>Mobs</b>\n<pre>${ml}</pre>`)});
 tg.on('pvpboard',()=>{if(activeSocket)activeSocket.emit('pvp:leaderboard');notify('⚔️ Leaderboard requested — /log')});
-tg.on('market',()=>{if(!Object.keys(marketPrices).length){notify('📊 No data.');return}const rows=Object.entries(marketPrices).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v])=>{const t=getPriceTrend(k);return`${cleanName(k).padEnd(14).slice(0,14)} ${String(v).padStart(6)} ${t==='rising'?'📈':t==='falling'?'📉':'➡️'} ${getMarketDepth(k)}ea`}).join('\n');notify(`📊 <b>Market</b>\n<pre>${rows}</pre>`)});
+tg.on('market',()=>{if(!Object.keys(marketPrices).length){notify('📊 No data.');return}const rows=Object.entries(marketPrices).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v])=>{const t=getTrendFor(k);return`${cleanName(k).padEnd(14).slice(0,14)} ${String(v).padStart(6)} ${t==='rising'?'📈':t==='falling'?'📉':'➡️'} ${getDepthFor(k)}ea`}).join('\n');notify(`📊 <b>Market</b>\n<pre>${rows}</pre>`)});
 tg.on('trades',()=>{if(!tradeLog.length){notify('🧾 None.');return}const rows=tradeLog.slice(-15).reverse().map(r=>`${new Date(r.t).toLocaleTimeString('id',{hour:'2-digit',minute:'2-digit'})} ${r.method==='quickSell'?'QS':'MK'} ${cleanName(r.defId).slice(0,12)} +${fmt(r.total)}`).join('\n');notify(`🧾 <b>Trades</b>\n<pre>${rows}</pre>`)});
 tg.on('listings',()=>{if(!myActiveListings.length){notify('🏷️ None.');return}const r=myActiveListings.map(l=>`${cleanName(l.defId).slice(0,14)} x${l.qty||1} @${fmt(l.price)}`).join('\n');notify(`🏷️ <b>Listings</b>\n<pre>${r}</pre>`)});
 tg.on('inventory',()=>{if(!inventory.length){notify('🎒 Empty.');return}const s=[...inventory].sort((a,b)=>((PRICE_FLOOR[b.defId]||QUICKSELL[b.defId]||0)*b.qty)-((PRICE_FLOOR[a.defId]||QUICKSELL[a.defId]||0)*a.qty));const rows=s.slice(0,25).map(i=>{const v=(PRICE_FLOOR[i.defId]||QUICKSELL[i.defId]||0)*i.qty;return`${KEEP.has(i.defId)?'🔒':'  '}${cleanName(i.defId).padEnd(13).slice(0,13)} x${String(i.qty).padStart(3)} ~${fmt(v)}`}).join('\n');const t=inventory.reduce((s,i)=>s+(PRICE_FLOOR[i.defId]||QUICKSELL[i.defId]||0)*i.qty,0);notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP}) ~${fmt(t)}\n<pre>${rows}</pre>`)});
@@ -668,8 +647,28 @@ tg.on('resume',()=>{if(!paused){notify('▶️ Running.');return}paused=false;no
 tg.on('reauth',()=>{notify('🔑 Re-auth…');token=null;try{if(activeSocket)activeSocket.disconnect()}catch{}setTimeout(startBot,1500)});
 tg.on('ping',()=>notify(`🏓 pong · ${connected?'🟢':'🔴'} · ${fmtUptime(Date.now()-stats.startTime)} · ${serverPlayerCount} online`));
 tg.on('schedule',()=>{const l=schedulePhases.map((p,i)=>`${i===schedIdx?'▶️':'  '} ${p.state.toUpperCase()} ${p.hours}h`).join('\n');notify(`🗓️ <b>Schedule</b>\n${scheduleActive?schedStatus():'off'}\n<pre>${l||'none'}</pre>`)});
-tg.on('restart',()=>{notify('♻️ Restarting…');setTimeout(()=>process.exit(0),800)});
-tg.on('update',()=>{notify('⬇️ Pulling…');const{execFile}=require('child_process');execFile('git',['-C',__dirname,'pull','--ff-only'],(e,o,s)=>{notify('<pre>'+esc(String(o||s||e).slice(0,600))+'</pre>');if(!e){notify('♻️ Restarting…');setTimeout(()=>process.exit(0),1000)}})});
+function runExec(cmd,args){return new Promise((resolve)=>{execFile(cmd,args,{cwd:__dirname},(error,stdout,stderr)=>resolve({error,stdout:String(stdout||''),stderr:String(stderr||'')}))})}
+async function inspectUpdateState(){
+  const branch = await runExec('git',['rev-parse','--abbrev-ref','HEAD']);
+  if(branch.error)return{ok:false,reason:`git branch failed: ${branch.error.message}`};
+  const branchName = branch.stdout.trim();
+  const dirty = await runExec('git',['status','--porcelain']);
+  if(dirty.error)return{ok:false,reason:`git status failed: ${dirty.error.message}`};
+  if(dirty.stdout.trim())return{ok:false,reason:'repo has local changes; commit or stash them first'};
+  const fetch = await runExec('git',['fetch','origin',branchName,'--tags']);
+  if(fetch.error)return{ok:false,reason:`git fetch failed: ${fetch.stderr.trim()||fetch.error.message}`};
+  const local = await runExec('git',['rev-parse','HEAD']);
+  const remote = await runExec('git',['rev-parse',`origin/${branchName}`]);
+  const base = await runExec('git',['merge-base','HEAD',`origin/${branchName}`]);
+  if(local.error||remote.error||base.error)return{ok:false,reason:'failed to compare local and remote refs'};
+  const localSha=local.stdout.trim(), remoteSha=remote.stdout.trim(), baseSha=base.stdout.trim();
+  if(localSha===remoteSha)return{ok:true,status:'up_to_date',branch:branchName};
+  if(localSha!==baseSha&&remoteSha!==baseSha)return{ok:false,reason:`branch ${branchName} diverged from origin/${branchName}; manual review needed`};
+  if(localSha!==baseSha)return{ok:false,reason:`local branch ${branchName} is ahead of origin; push or reconcile first`};
+  return{ok:true,status:'behind',branch:branchName,localSha,remoteSha};
+}
+tg.on('restart',()=>{if(maintenanceInFlight){notify('🛠️ Maintenance already running.');return}maintenanceInFlight=true;notify('♻️ Restarting…');setTimeout(()=>process.exit(0),800)});
+tg.on('update',async()=>{if(maintenanceInFlight){notify('🛠️ Maintenance already running.');return}maintenanceInFlight=true;try{notify('🔎 Checking repo…');const state=await inspectUpdateState();if(!state.ok){notify(`⚠️ Update blocked: ${esc(state.reason)}`);maintenanceInFlight=false;return}if(state.status==='up_to_date'){notify('✅ Already latest on origin.');maintenanceInFlight=false;return}notify(`⬇️ Pulling origin/${state.branch}…`);const pull=await runExec('git',['pull','--ff-only','origin',state.branch]);const summary=esc((pull.stdout||pull.stderr||'no output').slice(0,600));notify('<pre>'+summary+'</pre>');if(pull.error){notify(`⚠️ Update failed: ${esc(pull.error.message)}`);maintenanceInFlight=false;return}notify('♻️ Restarting…');setTimeout(()=>process.exit(0),1000)}catch(err){notify(`⚠️ Update failed: ${esc(err.message||String(err))}`);maintenanceInFlight=false}});
 
 // ============ CRASH ============
 process.on('uncaughtException',(err)=>{log('💥 '+((err&&err.stack)||err));notify(`💥 <b>Crash</b>: ${err&&err.message||err}`);setTimeout(()=>process.exit(1),1200)});
@@ -678,7 +677,6 @@ process.on('unhandledRejection',(r)=>{log('💥 unhandledRejection: '+((r&&r.sta
 // ============ SCHEDULE ============
 let schedulePhases=[],schedIdx=0,schedPhaseEnd=0;
 const scheduleActive=config.scheduleEnabled;
-function parseSchedule(raw){return raw.split(',').map(s=>{const[st,h]=s.split(':');return{state:(st||'').trim().toLowerCase()==='off'?'off':'on',hours:parseFloat(h)||1}}).filter(p=>p.hours>0)}
 function jitterMs(h){return Math.round(h*3600000*(1+(Math.random()*2-1)*config.scheduleJitterPct/100))}
 function schedUntilStr(){return new Date(schedPhaseEnd).toISOString().slice(11,16)}
 function applyPhase(ann){const p=schedulePhases[schedIdx];if(!p)return;schedPhaseEnd=Date.now()+jitterMs(p.hours);if(p.state==='on'){if(stopped){stopped=false;startBot()}}else{stopped=true;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false}if(ann)notifySys(`🗓️ <b>${p.state.toUpperCase()}</b> ~${p.hours}h`)}
