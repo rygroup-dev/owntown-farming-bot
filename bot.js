@@ -83,11 +83,14 @@ const HEAL_HP = 80;
 
 // ============ PRICE FLOORS ============
 const PRICE_FLOOR = {
-  fish_sun_carp: 1.5, fish_moon_koi: 0.2, fish_void_angler: 0.3,
-  fish_abyssal_lantern: 0.3, fish_golden_koi: 0.3, fish_silver_darter: 0.1,
-  mat_resonance_core: 3, mat_raw_resonite: 0.1, mat_circuit_scrap: 0.1,
-  mat_iron_shard: 0.05, mat_carbon_fiber: 0.5,
-  gear_resonite_edge: 0.2, gear_fault_greaves: 0.2, gear_volt_anklets: 0.1,
+  fish_sun_carp: 0.02, fish_moon_koi: 0.19, fish_void_angler: 0.3,
+  fish_abyssal_lantern: 0.3, fish_golden_koi: 0.3, fish_silver_darter: 0.02,
+  mat_resonance_core: 0.1, mat_raw_resonite: 0.5, mat_circuit_scrap: 0.1,
+  mat_iron_shard: 0.05, mat_carbon_fiber: 0.1,
+  gear_resonite_edge: 5, gear_fault_greaves: 10, gear_volt_anklets: 1,
+  gear_current_blade: 3, gear_faultplate: 1, gear_surge_helm: 1,
+  gear_reef_plate: 1.5, gear_tide_helm: 1.5,
+  pet_golden_whale: 99, pet_sea_dragon: 100,
 };
 const QUICKSELL = {
   mat_raw_resonite: 6, mat_circuit_scrap: 3, mat_iron_shard: 2,
@@ -98,8 +101,8 @@ const QUICKSELL = {
 
 // ============ ITEM CATEGORIES ============
 const KEEP = new Set(['tool_pulse_pick','cos_coastal_tee','cos_palm_sneakers','kit_repair','med_patch','food_ember_skewer','food_volt_noodles','pet_demon_salamander','pet_golden_whale','pet_sea_dragon','permit_redline','gear_driftwood_baton']);
-const MARKETPLACE_ONLY = new Set(['fish_sun_carp','fish_moon_koi','fish_void_angler','fish_abyssal_lantern','fish_golden_koi','fish_silver_darter','mat_resonance_core','gear_resonite_edge','gear_fault_greaves','gear_volt_anklets']);
-const SAFE_QUICKSELL = new Set(['mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber']);
+const MARKETPLACE_ONLY = new Set(['fish_moon_koi','fish_void_angler','fish_abyssal_lantern','fish_golden_koi','gear_resonite_edge','gear_fault_greaves','gear_volt_anklets','gear_current_blade','pet_golden_whale','pet_sea_dragon']);
+const SAFE_QUICKSELL = new Set(['mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber','mat_resonance_core','fish_sun_carp','fish_silver_darter']);
 const FOOD_ITEMS = new Set(['food_ember_skewer','food_volt_noodles','med_patch']);
 
 const GEAR_RECIPES = {
@@ -208,8 +211,12 @@ function decideNextAction(){
   if(hp<LOW_HP&&zone!=='clinic')return'heal';
   if(inventory.length>=CARRY_CAP-4)return'sell';
   if(stamina<LOW_STAMINA)return'eat';
-  // Quest-driven: if quest needs sell and we have actually sellable items
-  if(questState&&questState.activeId==='sell_your_first_haul'&&inventory.some(isSellable))return'sell';
+  // Quest-driven: prioritise the activity the active quest needs
+  const qn=questNeedsAction();
+  if(qn==='sell'&&inventory.some(i=>!KEEP.has(i.defId)&&i.qty>0&&i.status!=='locked'))return'sell';
+  if(qn==='mining')return'mining';
+  if(qn==='fishing')return'fishing';
+  if(qn==='combat')return'combat';
   const order=['sell','mining','fishing','combat','mining','fishing','mining','combat'];
   let action=order[stats.cycles%order.length];
   // Skip sell rotation when nothing to sell — advance to next activity
@@ -218,17 +225,62 @@ function decideNextAction(){
 }
 
 // ============ QUEST AUTO-PROGRESS ============
+// Known quest chain — map questId to required action type so the orchestrator
+// can prioritise the right activity automatically.
+const QUEST_NEEDS = {
+  'sell_your_first_haul': 'sell',
+  'first_shift_deepworks': 'mining',
+  'catch_of_the_day': 'fishing',
+  'threat_assessment': 'combat',
+};
+
+let questSellAttempts = 0;
+const QUEST_SELL_MAX_ATTEMPTS = 5;
+
+function questNeedsAction(){
+  if(!questState||!questState.activeId)return null;
+  const need = QUEST_NEEDS[questState.activeId]||null;
+  if(need === 'sell' && questSellAttempts >= QUEST_SELL_MAX_ATTEMPTS) return null;
+  return need;
+}
+
 function tryProgressQuest(sock){
   if(!questState||!questState.activeId)return;
   const q=questState.activeId;
-  // "sell_your_first_haul" — walk to market, then sell triggers completion
-  if(q==='sell_your_first_haul'&&questState.step===0){
-    log('📜 Quest: walking to market to progress quest');
+
+  if(q==='sell_your_first_haul'){
+    questSellAttempts++;
     walkDirect(sock,ZONE_TARGETS.market,()=>{
+      sock.emit('quest:action',{type:'interact'});
       sock.emit('quest:action',{type:'check'});
+      const item=inventory.find(i=>!KEEP.has(i.defId)&&i.qty>0&&i.status!=='locked');
+      if(item){
+        // Use sell decision engine: respect floor prices + live market
+        const d=getSellDecision(item.defId,item.qty);
+        let price;
+        if(d.action==='MARKETPLACE'&&d.price>0) price=d.price;
+        else {
+          const live=marketPrices[item.defId];
+          const floor=PRICE_FLOOR[item.defId]||0;
+          price=Math.max(1,Math.round((live||floor||QUICKSELL[item.defId]||5)*0.92));
+        }
+        sock.emit('marketplace:list',{instanceId:item.instanceId,qty:1,price});
+        log(`📜 Quest sell: list ${item.defId} x1 @${price} (floor:${PRICE_FLOOR[item.defId]||'-'} live:${marketPrices[item.defId]||'-'}) attempt ${questSellAttempts}/${QUEST_SELL_MAX_ATTEMPTS}`);
+        setTimeout(()=>{
+          sock.emit('quest:action',{type:'check'});
+          // Also try quicksell as fallback
+          const qs=inventory.find(i=>SAFE_QUICKSELL.has(i.defId)&&i.qty>0);
+          if(qs){
+            sock.emit('marketplace:quickSell',{instanceId:qs.instanceId,qty:1});
+            log(`📜 Quest sell: also quickSell ${qs.defId} x1`);
+          }
+          setTimeout(()=>sock.emit('quest:action',{type:'check'}),2000);
+        },2000);
+      }
     });
+    return;
   }
-  // Generic: always emit check after actions
+
   sock.emit('quest:action',{type:'check'});
 }
 function getAliveMonster(){if(liveMonsters.length>0){const alive=liveMonsters.filter(m=>m.alive);if(alive.length>0)return alive[stats.currentMonsterIdx%alive.length]}return{id:'mon_1',pos:{x:-100,z:-120}}}
@@ -288,12 +340,12 @@ function runNextCycle(sock){
   if(type==='eat'){tryEatFood(sock);setTimeout(()=>runNextCycle(sock),2000);return}
   if(type==='sell'){
     sock.emit('economy:ledger');
-    // Walk to market first (needed for quest progress + better for selling)
     walkDirect(sock,ZONE_TARGETS.market,()=>{
+      sock.emit('quest:action',{type:'interact'});
       sock.emit('quest:action',{type:'check'});
       doSellPhase(sock,()=>{
-        // After selling, check quest progress
         sock.emit('quest:action',{type:'check'});
+        tryProgressQuest(sock);
         setTimeout(()=>runNextCycle(sock),1500);
       });
     });
@@ -369,14 +421,16 @@ async function startBot(){
     const changed=!prev||prev.activeId!==d.activeId||prev.step!==d.step||prev.progress!==d.progress||(prev.completed||[]).length!==(d.completed||[]).length;
     if(changed){
       log(`📜 Quest: ${d.activeId||'none'} step:${d.step||0} progress:${d.progress||0} done:${(d.completed||[]).length}`);
-      // Quest completed notification
       if(prev&&prev.activeId&&!d.activeId){
         stats.questsCompleted++;
-        notify(`🏆 <b>Quest selesai!</b> ${prev.activeId}\nTotal: ${(d.completed||[]).length} quests`);
+        notify(`🏆 <b>Quest done!</b> ${prev.activeId}\nTotal: ${(d.completed||[]).length} quests`);
       }
-      // New quest available — auto-start
-      if(prev&&prev.activeId&&d.activeId&&prev.activeId!==d.activeId){
-        notify(`📜 <b>Quest baru:</b> ${d.activeId}`);
+      if(d.activeId&&(!prev||prev.activeId!==d.activeId)){
+        questSellAttempts=0;
+        notify(`📜 <b>New quest:</b> ${d.activeId}`);
+      }
+      if(d.activeId&&prev&&prev.activeId===d.activeId&&(d.step!==prev.step||d.progress!==prev.progress)){
+        notify(`📜 <b>${d.activeId}</b> step:${d.step} progress:${d.progress}`);
       }
     }
   });
