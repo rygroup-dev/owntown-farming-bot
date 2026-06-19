@@ -229,11 +229,8 @@ function decideNextAction(){
   if(hp<LOW_HP&&zone!=='clinic')return'heal';
   if(inventory.length>=CARRY_CAP-4)return'sell';
   if(stamina<LOW_STAMINA)return'eat';
-  // Quest-driven: if quest needs sell and we have actually sellable (not just holdable) items
-  if(questState&&questState.activeId==='sell_your_first_haul'){
-    const sellable=inventory.filter(i=>!KEEP.has(i.defId)&&i.qty>0&&(SAFE_QUICKSELL.has(i.defId)||marketPrices[i.defId]));
-    if(sellable.length>0)return'sell';
-  }
+  // Quest-driven: if quest needs sell and we have actually sellable items
+  if(questState&&questState.activeId==='sell_your_first_haul'&&inventory.some(i=>!KEEP.has(i.defId)&&i.qty>0&&!MARKETPLACE_ONLY.has(i.defId)&&SAFE_QUICKSELL.has(i.defId)))return'sell';
   const order=['sell','mining','fishing','combat','mining','fishing','mining','combat'];
   return order[stats.cycles%order.length];
 }
@@ -280,9 +277,14 @@ function walkStaged(sock,wps,idx,cb){if(!connected)return;if(idx>=wps.length){cb
 function walkDirect(sock,target,cb){if(!connected){cb();return}let step=0;const baseMs=250+Math.floor(Math.random()*100);const iv=setInterval(()=>{if(!connected){clearInterval(iv);return}const dx=target.x-pos.x,dz=target.z-pos.z,dist=Math.sqrt(dx*dx+dz*dz);if(dist<5||step>=MAX_WALK_STEPS){clearInterval(iv);sock.emit('player:input',{pos:{x:target.x,y:0,z:target.z},rotY:0,anim:'idle'});setTimeout(cb,800+Math.floor(Math.random()*400));return}const jitter=(Math.random()-0.5)*0.06;const speed=WALK_SPEED+jitter;pos.x+=(dx/dist)*speed;pos.z+=(dz/dist)*speed;sock.emit('player:input',{pos:{x:pos.x,y:0,z:pos.z},rotY:Math.atan2(dx,dz),anim:'walk'});step++},baseMs)}
 
 // ============ SELL ============
+function isSellable(item){
+  if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')return false;
+  const d=getSellDecision(item.defId,item.qty);
+  return d.action!=='HOLD';
+}
 function doSellPhase(sock,cb){
-  const sellable=inventory.filter(i=>!KEEP.has(i.defId)&&i.qty>0&&i.status!=='locked');
-  if(!sellable.length){log('💰 Nothing to sell');cb();return}
+  const sellable=inventory.filter(isSellable);
+  if(!sellable.length){log('💰 Nothing to sell (all kept/held)');cb();return}
   tryCraft(sock);log(`💰 SELL ${sellable.length} sellable / ${inventory.length} total`);const old=[...myActiveListings];function cancelNext(i){if(i>=old.length){freshSell(sock,cb);return}sock.emit('marketplace:cancel',{listingId:old[i].id});stats.canceled++;setTimeout(()=>cancelNext(i+1),1500)}if(old.length>0)cancelNext(0);else freshSell(sock,cb)}
 function freshSell(sock,cb){const toM=[],toQ=[],toH=[];for(const item of inventory){if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')continue;const d=getSellDecision(item.defId,item.qty);if(d.action==='HOLD'){toH.push({defId:item.defId,qty:item.qty,reason:d.reason});stats.holdCount++}else if(d.action==='MARKETPLACE')toM.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty,price:d.price,marketBest:d.marketBest});else toQ.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty})}log(`📊 MKT:${toM.length} QS:${toQ.length} HOLD:${toH.length}`);for(const m of toM)log(`  📋 ${m.defId} x${m.qty} → MKT @${m.price} (best:${m.marketBest})`);for(const h of toH)log(`  🛡️ ${h.defId} x${h.qty} → HOLD (${h.reason})`);for(const q of toQ)log(`  💸 ${q.defId} x${q.qty} → QS`);function listNext(i){if(i>=toM.length||!connected){if(toQ.length)quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000);return}const m=toM[i];sock.emit('marketplace:list',{instanceId:m.instanceId,qty:m.qty,price:m.price});log(`📋 ${m.defId} x${m.qty} @${m.price}`);setTimeout(()=>listNext(i+1),MARKET_INTERVAL)}if(toM.length>0)listNext(0);else if(toQ.length){quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000)}else cb()}
 function quickSellSafe(sock,items){for(const it of items){if(!SAFE_QUICKSELL.has(it.defId)||!it.instanceId)continue;sock.emit('marketplace:quickSell',{instanceId:it.instanceId,qty:it.qty||1})}}
