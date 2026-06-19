@@ -32,6 +32,7 @@ class Telegram {
     this.log = logger || (() => {});
     this.onChatIdLearned = onChatIdLearned || (() => {});
     this.handlers = {};        // command -> fn(args, chatId)
+    this.callbackHandlers = {}; // callback_data prefix -> fn(data, chatId, messageId)
     this.offset = 0;
     this.queue = [];
     this.sending = false;
@@ -39,6 +40,32 @@ class Telegram {
   }
 
   on(command, fn) { this.handlers[command] = fn; }
+  onCallback(prefix, fn) { this.callbackHandlers[prefix] = fn; }
+
+  async sendKeyboard(text, buttons) {
+    if (!this.enabled || !this.chatId) return;
+    const res = await tgApi(this.token, 'sendMessage', {
+      chat_id: this.chatId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons },
+    });
+    if (!res.ok) this.log(`📱 sendKeyboard failed: ${res.description || res.error || 'unknown'}`);
+    return res;
+  }
+
+  async editMessage(chatId, messageId, text, buttons) {
+    if (!this.enabled) return;
+    const body = { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', disable_web_page_preview: true };
+    if (buttons) body.reply_markup = { inline_keyboard: buttons };
+    return tgApi(this.token, 'editMessageText', body);
+  }
+
+  async answerCallback(callbackId, text) {
+    if (!this.enabled) return;
+    return tgApi(this.token, 'answerCallbackQuery', { callback_query_id: callbackId, text: text || '' });
+  }
 
   async send(text) {
     if (!this.enabled || !this.chatId) return;
@@ -77,6 +104,25 @@ class Telegram {
     if (res.ok && Array.isArray(res.result)) {
       for (const upd of res.result) {
         this.offset = upd.update_id + 1;
+
+        // Handle callback queries (inline button presses)
+        if (upd.callback_query) {
+          const cb = upd.callback_query;
+          const cbChat = String(cb.message?.chat?.id || '');
+          if (cbChat && cbChat === String(this.chatId)) {
+            const data = cb.data || '';
+            const prefix = data.split(':')[0];
+            const handler = this.callbackHandlers[prefix];
+            if (handler) {
+              try { await handler(data, cbChat, cb.message?.message_id, cb.id); }
+              catch (e) { this.answerCallback(cb.id, 'Error: ' + e.message); }
+            } else {
+              this.answerCallback(cb.id);
+            }
+          }
+          continue;
+        }
+
         const msg = upd.message || upd.edited_message;
         if (!msg || !msg.text) continue;
         const fromChat = String(msg.chat.id);

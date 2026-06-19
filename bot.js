@@ -514,30 +514,34 @@ tg.on('balance',()=>notify(`💰 <b>Balance</b>\n<pre>OTWN     ${fmt(Math.round(
 tg.on('daily',()=>notify(buildDaily()));
 tg.on('income',()=>{const p=getProfitSummary();const hrs=getHourly(12).map(h=>`${h.h}:00 ${'█'.repeat(Math.min(10,Math.ceil(h.v/Math.max(1,...getHourly(12).map(x=>x.v))*10)))} +${fmt(h.v)}`).join('\n');notify(`💵 <b>Income</b>\n<pre>Total  ${fmt(p.totalEarned)}\nRate   ${fmt(p.rate)}/h\nQS     +${fmt(stats.earnedQuick)}\nMKT    +${fmt(stats.earnedMarket)}\nPvP    +${fmt(stats.pvpEarnings)}\nSold   ${fmt(p.itemsSold)}</pre>\n<pre>${hrs}</pre>`)});
 tg.on('wallet',async(args)=>{
-  // /wallet deposit <amount> or /wallet withdraw <amount>
   const sub=(args[0]||'').toLowerCase();
   const amount=parseFloat(args[1])||0;
   if(sub==='deposit'&&amount>0){
     if(amount<100){notify('⚠️ Minimum deposit: 100 OTWN');return}
     if(balance<amount){notify(`⚠️ Balance ${fmt(Math.round(balance))} < ${amount}`);return}
     if(activeSocket)activeSocket.emit('bank:deposit',{amount});
-    notify(`🏦 <b>Depositing</b> ${fmt(amount)} OTWN ke bank…`);
+    notify(`🏦 <b>Depositing</b> ${fmt(amount)} OTWN…`);
     return;
   }
   if(sub==='withdraw'&&amount>0){
     const minW=bankInfo?.withdrawMin||5000;
-    if(amount<minW){notify(`⚠️ Minimum withdraw: ${fmt(minW)} OTWN`);return}
-    if(!bankInfo||bankInfo.withdrawable<amount){notify(`⚠️ Bank withdrawable: ${fmt(bankInfo?.withdrawable||0)} < ${amount}`);return}
+    if(amount<minW){notify(`⚠️ Min withdraw: ${fmt(minW)} OTWN`);return}
+    if(!bankInfo||bankInfo.withdrawable<amount){notify(`⚠️ Withdrawable: ${fmt(bankInfo?.withdrawable||0)} < ${amount}`);return}
     if(activeSocket)activeSocket.emit('bank:withdraw',{amount});
-    notify(`🏦 <b>Withdrawing</b> ${fmt(amount)} OTWN dari bank…`);
+    notify(`🏦 <b>Withdrawing</b> ${fmt(amount)} OTWN…`);
     return;
   }
-  // Show wallet info
   try{await checkBank(token)}catch{}
   const bi=bankInfo||{};
-  notify([
-    '🔑 <b>Wallet</b>',
-    `<code>${WALLET_ADDR||'auto-derive'}</code>`,
+  const buttons=[
+    [{text:'💰 Deposit 100',callback_data:'wd:d:100'},{text:'💰 Deposit 500',callback_data:'wd:d:500'}],
+    [{text:'💰 Deposit 1000',callback_data:'wd:d:1000'},{text:'💰 Deposit All',callback_data:'wd:d:all'}],
+    [{text:'🏦 Withdraw 5000',callback_data:'wd:w:5000'},{text:'🏦 Withdraw All',callback_data:'wd:w:all'}],
+    [{text:'🔄 Refresh',callback_data:'wd:refresh'}],
+  ];
+  tg.sendKeyboard([
+    '🔑 <b>Wallet & Bank</b>',
+    `<code>${WALLET_ADDR||'auto'}</code>`,
     '',
     '<pre>' +
     `💰 Balance     ${fmt(Math.round(balance))} OTWN\n` +
@@ -548,9 +552,65 @@ tg.on('wallet',async(args)=>{
     `⛓️ On-chain    ${fmt(bi.onChainBalance||0)} OTWN\n` +
     `📅 Daily       ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}` +
     '</pre>',
-    '',
-    '<i>💡 /wallet deposit [amount]\n💡 /wallet withdraw [amount]</i>',
-  ].join('\n'));
+  ].join('\n'), buttons);
+});
+
+// Inline button handler for wallet
+tg.onCallback('wd',async(data,chatId,msgId,cbId)=>{
+  const parts=data.split(':');
+  const action=parts[1];
+  const val=parts[2];
+
+  if(action==='refresh'){
+    try{await checkBank(token)}catch{}
+    const bi=bankInfo||{};
+    const buttons=[
+      [{text:'💰 Deposit 100',callback_data:'wd:d:100'},{text:'💰 Deposit 500',callback_data:'wd:d:500'}],
+      [{text:'💰 Deposit 1000',callback_data:'wd:d:1000'},{text:'💰 Deposit All',callback_data:'wd:d:all'}],
+      [{text:'🏦 Withdraw 5000',callback_data:'wd:w:5000'},{text:'🏦 Withdraw All',callback_data:'wd:w:all'}],
+      [{text:'🔄 Refresh',callback_data:'wd:refresh'}],
+    ];
+    await tg.editMessage(chatId,msgId,[
+      '🔑 <b>Wallet & Bank</b> (updated)',
+      `<code>${WALLET_ADDR||'auto'}</code>`,
+      '',
+      '<pre>' +
+      `💰 Balance     ${fmt(Math.round(balance))} OTWN\n` +
+      `🔒 Locked      ${fmt(lockedBalance)}\n` +
+      `🍬 Candy       ${fmt(candyBalance)}\n` +
+      `🎰 Chip        ${fmt(chipBalance)}\n` +
+      `🏦 Bank        ${fmt(bi.withdrawable||0)} withdrawable\n` +
+      `⛓️ On-chain    ${fmt(bi.onChainBalance||0)} OTWN\n` +
+      `📅 Daily       ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}` +
+      '</pre>',
+    ].join('\n'), buttons);
+    await tg.answerCallback(cbId,'✅ Refreshed');
+    return;
+  }
+
+  if(action==='d'){
+    const amount=val==='all'?Math.floor(balance-config.balanceReserve):parseInt(val);
+    if(!amount||amount<100){await tg.answerCallback(cbId,'⚠️ Min 100 OTWN');return}
+    if(balance<amount){await tg.answerCallback(cbId,`⚠️ Balance ${Math.round(balance)} < ${amount}`);return}
+    if(activeSocket)activeSocket.emit('bank:deposit',{amount});
+    await tg.answerCallback(cbId,`💰 Depositing ${amount} OTWN…`);
+    notify(`🏦 <b>Deposit</b> ${fmt(amount)} OTWN ke bank…`);
+    return;
+  }
+
+  if(action==='w'){
+    const minW=bankInfo?.withdrawMin||5000;
+    const maxW=bankInfo?.withdrawable||0;
+    const amount=val==='all'?maxW:parseInt(val);
+    if(!amount||amount<minW){await tg.answerCallback(cbId,`⚠️ Min ${minW} OTWN`);return}
+    if(maxW<amount){await tg.answerCallback(cbId,`⚠️ Withdrawable: ${Math.round(maxW)}`);return}
+    if(activeSocket)activeSocket.emit('bank:withdraw',{amount});
+    await tg.answerCallback(cbId,`🏦 Withdrawing ${amount} OTWN…`);
+    notify(`🏦 <b>Withdraw</b> ${fmt(amount)} OTWN dari bank…`);
+    return;
+  }
+
+  await tg.answerCallback(cbId);
 });
 tg.on('quest',()=>{if(!questState){notify('📜 No quest data.');return}notify(`📜 <b>Quest</b>\nActive: <b>${questState.activeId||'none'}</b>\nStep: ${questState.step||0} Progress: ${questState.progress||0}\nDone: ${(questState.completed||[]).join(', ')||'none'}`)});
 tg.on('candy',async()=>{try{const h=await apiGet('/api/health');const e=h.data?.economy||{};notify(`🍬 <b>Candy</b>\nBalance: <b>${fmt(candyBalance)}</b>\n<pre>Price    $${e.candyUsd||'?'}\n1 CANDY  ${e.lastCandyOtwn||'?'} OTWN\nStaked   ${fmt(e.candyStaked)} OTWN\nPool     ${fmt(e.candyDailyPool)}/day\nMinted   ${fmt(e.candyMinted)}\nBurned   ${fmt(e.candyBurned)}\nVol 24h  ${fmt(e.candyVolume24h)}</pre>`)}catch(er){notify(`🍬 ${fmt(candyBalance)} (err: ${er.message})`)}});
