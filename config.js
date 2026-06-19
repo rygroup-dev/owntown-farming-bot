@@ -74,7 +74,7 @@ const config = {
   // Auto-powerup: buy items that help leveling/sustained farming
   powerupEnabled: (process.env.POWERUP_ENABLED || 'true').toLowerCase() === 'true',
   watchdogStuckMin: parseInt(process.env.WATCHDOG_STUCK_MIN || '5', 10),
-  logPath: process.env.LOG_PATH || '/tmp/owntown_v23.log',
+  logPath: process.env.LOG_PATH || '/tmp/owntown_v25.log',
   tokenPath: process.env.TOKEN_PATH || '/tmp/owntown_token.txt',
 };
 

@@ -1,11 +1,11 @@
 {
-  "name": "ometown-farmer",
+  "name": "owntown-farmer",
   "version": "25.0.0",
   "description": "Full-featured automated farming bot for Owntown.fun — mining, fishing, combat, PvP, property, marketplace, bank, crafting",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test"
   },
   "dependencies": {
     "socket.io-client": "^4.7.0",
