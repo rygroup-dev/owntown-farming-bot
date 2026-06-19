@@ -516,100 +516,138 @@ tg.on('income',()=>{const p=getProfitSummary();const hrs=getHourly(12).map(h=>`$
 tg.on('wallet',async(args)=>{
   const sub=(args[0]||'').toLowerCase();
   const amount=parseFloat(args[1])||0;
+  const depMin=bankInfo?.depositMin||10;
+  const wdMin=bankInfo?.withdrawMin||5000;
+  const wdFee=bankInfo?.withdrawFeePct||0.02;
+
   if(sub==='deposit'&&amount>0){
-    if(amount<100){notify('⚠️ Minimum deposit: 100 OTWN');return}
+    if(amount<depMin){notify(`⚠️ Min deposit: ${depMin} OTWN`);return}
     if(balance<amount){notify(`⚠️ Balance ${fmt(Math.round(balance))} < ${amount}`);return}
     if(activeSocket)activeSocket.emit('bank:deposit',{amount});
     notify(`🏦 <b>Depositing</b> ${fmt(amount)} OTWN…`);
     return;
   }
   if(sub==='withdraw'&&amount>0){
-    const minW=bankInfo?.withdrawMin||5000;
-    if(amount<minW){notify(`⚠️ Min withdraw: ${fmt(minW)} OTWN`);return}
+    if(amount<wdMin){notify(`⚠️ Min withdraw: ${fmt(wdMin)} OTWN`);return}
     if(!bankInfo||bankInfo.withdrawable<amount){notify(`⚠️ Withdrawable: ${fmt(bankInfo?.withdrawable||0)} < ${amount}`);return}
     if(activeSocket)activeSocket.emit('bank:withdraw',{amount});
-    notify(`🏦 <b>Withdrawing</b> ${fmt(amount)} OTWN…`);
+    const fee=Math.round(amount*wdFee);
+    notify(`🏦 <b>Withdrawing</b> ${fmt(amount)} OTWN (fee ~${fee})…`);
     return;
   }
+
   try{await checkBank(token)}catch{}
   const bi=bankInfo||{};
-  const buttons=[
-    [{text:'💰 Deposit 100',callback_data:'wd:d:100'},{text:'💰 Deposit 500',callback_data:'wd:d:500'}],
-    [{text:'💰 Deposit 1000',callback_data:'wd:d:1000'},{text:'💰 Deposit All',callback_data:'wd:d:all'}],
-    [{text:'🏦 Withdraw 5000',callback_data:'wd:w:5000'},{text:'🏦 Withdraw All',callback_data:'wd:w:all'}],
-    [{text:'🔄 Refresh',callback_data:'wd:refresh'}],
-  ];
+  const bal=Math.round(balance);
+  const wdable=bi.withdrawable||0;
+
+  // Dynamic deposit buttons based on balance
+  const depBtns=[];
+  if(bal>=depMin)depBtns.push({text:`💰 Deposit ${Math.min(50,bal)}`,callback_data:`wd:d:${Math.min(50,bal)}`});
+  if(bal>=100)depBtns.push({text:'💰 Deposit 100',callback_data:'wd:d:100'});
+  if(bal>=500)depBtns.push({text:'💰 Deposit 500',callback_data:'wd:d:500'});
+  const depRow2=[];
+  if(bal>=1000)depRow2.push({text:'💰 Deposit 1000',callback_data:'wd:d:1000'});
+  if(bal>depMin)depRow2.push({text:'💰 Deposit ALL',callback_data:'wd:d:all'});
+
+  // Dynamic withdraw buttons
+  const wdBtns=[];
+  if(wdable>=wdMin)wdBtns.push({text:`🏦 Withdraw ${wdMin}`,callback_data:`wd:w:${wdMin}`});
+  if(wdable>wdMin)wdBtns.push({text:'🏦 Withdraw ALL',callback_data:'wd:w:all'});
+
+  const buttons=[];
+  if(depBtns.length)buttons.push(depBtns.slice(0,3));
+  if(depRow2.length)buttons.push(depRow2);
+  if(wdBtns.length)buttons.push(wdBtns);
+  buttons.push([{text:'🔄 Refresh',callback_data:'wd:refresh'}]);
+
   tg.sendKeyboard([
     '🔑 <b>Wallet & Bank</b>',
     `<code>${WALLET_ADDR||'auto'}</code>`,
     '',
     '<pre>' +
-    `💰 Balance     ${fmt(Math.round(balance))} OTWN\n` +
-    `🔒 Locked      ${fmt(lockedBalance)}\n` +
-    `🍬 Candy       ${fmt(candyBalance)}\n` +
-    `🎰 Chip        ${fmt(chipBalance)}\n` +
-    `🏦 Bank        ${fmt(bi.withdrawable||0)} withdrawable\n` +
-    `⛓️ On-chain    ${fmt(bi.onChainBalance||0)} OTWN\n` +
-    `📅 Daily       ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}` +
+    `💰 Balance      ${fmt(bal)} OTWN\n` +
+    `🔒 Locked       ${fmt(lockedBalance)}\n` +
+    `🍬 Candy        ${fmt(candyBalance)}\n` +
+    `🎰 Chip         ${fmt(chipBalance)}\n` +
+    `─────────────────────\n` +
+    `🏦 Withdrawable  ${fmt(wdable)} OTWN\n` +
+    `⛓️  On-chain     ${fmt(bi.onChainBalance||0)} OTWN\n` +
+    `📋 Deposit min   ${depMin}\n` +
+    `📋 Withdraw min  ${fmt(wdMin)} (fee ${wdFee*100}%)` +
     '</pre>',
+    '',
+    `<i>Manual: /wallet deposit [n] · /wallet withdraw [n]</i>`,
   ].join('\n'), buttons);
 });
 
-// Inline button handler for wallet
 tg.onCallback('wd',async(data,chatId,msgId,cbId)=>{
   const parts=data.split(':');
   const action=parts[1];
   const val=parts[2];
+  const depMin=bankInfo?.depositMin||10;
+  const wdMin=bankInfo?.withdrawMin||5000;
+  const wdFee=bankInfo?.withdrawFeePct||0.02;
 
   if(action==='refresh'){
     try{await checkBank(token)}catch{}
     const bi=bankInfo||{};
-    const buttons=[
-      [{text:'💰 Deposit 100',callback_data:'wd:d:100'},{text:'💰 Deposit 500',callback_data:'wd:d:500'}],
-      [{text:'💰 Deposit 1000',callback_data:'wd:d:1000'},{text:'💰 Deposit All',callback_data:'wd:d:all'}],
-      [{text:'🏦 Withdraw 5000',callback_data:'wd:w:5000'},{text:'🏦 Withdraw All',callback_data:'wd:w:all'}],
-      [{text:'🔄 Refresh',callback_data:'wd:refresh'}],
-    ];
+    const bal=Math.round(balance);
+    const wdable=bi.withdrawable||0;
+    const depBtns=[];
+    if(bal>=depMin)depBtns.push({text:`💰 ${Math.min(50,bal)}`,callback_data:`wd:d:${Math.min(50,bal)}`});
+    if(bal>=100)depBtns.push({text:'💰 100',callback_data:'wd:d:100'});
+    if(bal>=500)depBtns.push({text:'💰 500',callback_data:'wd:d:500'});
+    const depRow2=[];
+    if(bal>=1000)depRow2.push({text:'💰 1000',callback_data:'wd:d:1000'});
+    if(bal>depMin)depRow2.push({text:'💰 ALL',callback_data:'wd:d:all'});
+    const wdBtns=[];
+    if(wdable>=wdMin)wdBtns.push({text:`🏦 WD ${wdMin}`,callback_data:`wd:w:${wdMin}`});
+    if(wdable>wdMin)wdBtns.push({text:'🏦 WD ALL',callback_data:'wd:w:all'});
+    const buttons=[];
+    if(depBtns.length)buttons.push(depBtns.slice(0,3));
+    if(depRow2.length)buttons.push(depRow2);
+    if(wdBtns.length)buttons.push(wdBtns);
+    buttons.push([{text:'🔄 Refresh',callback_data:'wd:refresh'}]);
     await tg.editMessage(chatId,msgId,[
-      '🔑 <b>Wallet & Bank</b> (updated)',
+      '🔑 <b>Wallet & Bank</b> ✅',
       `<code>${WALLET_ADDR||'auto'}</code>`,
       '',
       '<pre>' +
-      `💰 Balance     ${fmt(Math.round(balance))} OTWN\n` +
-      `🔒 Locked      ${fmt(lockedBalance)}\n` +
-      `🍬 Candy       ${fmt(candyBalance)}\n` +
-      `🎰 Chip        ${fmt(chipBalance)}\n` +
-      `🏦 Bank        ${fmt(bi.withdrawable||0)} withdrawable\n` +
-      `⛓️ On-chain    ${fmt(bi.onChainBalance||0)} OTWN\n` +
-      `📅 Daily       ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}` +
+      `💰 Balance      ${fmt(bal)} OTWN\n` +
+      `🔒 Locked       ${fmt(lockedBalance)}\n` +
+      `🍬 Candy        ${fmt(candyBalance)}\n` +
+      `🎰 Chip         ${fmt(chipBalance)}\n` +
+      `─────────────────────\n` +
+      `🏦 Withdrawable  ${fmt(wdable)} OTWN\n` +
+      `⛓️  On-chain     ${fmt(bi.onChainBalance||0)} OTWN\n` +
+      `📋 Deposit min   ${depMin}\n` +
+      `📋 Withdraw min  ${fmt(wdMin)} (fee ${wdFee*100}%)` +
       '</pre>',
     ].join('\n'), buttons);
-    await tg.answerCallback(cbId,'✅ Refreshed');
+    await tg.answerCallback(cbId,'✅ Updated');
     return;
   }
 
   if(action==='d'){
-    const amount=val==='all'?Math.floor(balance-config.balanceReserve):parseInt(val);
-    if(!amount||amount<100){await tg.answerCallback(cbId,'⚠️ Min 100 OTWN');return}
+    const amount=val==='all'?Math.max(0,Math.floor(balance-config.balanceReserve)):parseInt(val);
+    if(!amount||amount<depMin){await tg.answerCallback(cbId,`⚠️ Min ${depMin} OTWN`);return}
     if(balance<amount){await tg.answerCallback(cbId,`⚠️ Balance ${Math.round(balance)} < ${amount}`);return}
     if(activeSocket)activeSocket.emit('bank:deposit',{amount});
-    await tg.answerCallback(cbId,`💰 Depositing ${amount} OTWN…`);
-    notify(`🏦 <b>Deposit</b> ${fmt(amount)} OTWN ke bank…`);
+    await tg.answerCallback(cbId,`💰 Deposit ${amount} OTWN sent`);
     return;
   }
 
   if(action==='w'){
-    const minW=bankInfo?.withdrawMin||5000;
     const maxW=bankInfo?.withdrawable||0;
     const amount=val==='all'?maxW:parseInt(val);
-    if(!amount||amount<minW){await tg.answerCallback(cbId,`⚠️ Min ${minW} OTWN`);return}
-    if(maxW<amount){await tg.answerCallback(cbId,`⚠️ Withdrawable: ${Math.round(maxW)}`);return}
+    if(!amount||amount<wdMin){await tg.answerCallback(cbId,`⚠️ Min ${wdMin} OTWN`);return}
+    if(maxW<amount){await tg.answerCallback(cbId,`⚠️ Available: ${Math.round(maxW)}`);return}
     if(activeSocket)activeSocket.emit('bank:withdraw',{amount});
-    await tg.answerCallback(cbId,`🏦 Withdrawing ${amount} OTWN…`);
-    notify(`🏦 <b>Withdraw</b> ${fmt(amount)} OTWN dari bank…`);
+    const fee=Math.round(amount*wdFee);
+    await tg.answerCallback(cbId,`🏦 Withdraw ${amount} (fee ~${fee}) sent`);
     return;
   }
-
   await tg.answerCallback(cbId);
 });
 tg.on('quest',()=>{if(!questState){notify('📜 No quest data.');return}notify(`📜 <b>Quest</b>\nActive: <b>${questState.activeId||'none'}</b>\nStep: ${questState.step||0} Progress: ${questState.progress||0}\nDone: ${(questState.completed||[]).join(', ')||'none'}`)});
