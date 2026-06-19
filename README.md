@@ -5,7 +5,7 @@
 ### a **RY GROUP** project
 
 Full-featured automated farming bot for [Owntown.fun](https://owntown.fun) — a Solana-based MMO game.
-Mining · Fishing · Combat · PvP · Marketplace · Banking · Crafting — plus a **self-fix system** and full **Telegram** control + **web dashboard**.
+Mining · Fishing · Combat · PvP · Marketplace · Banking · Crafting — plus a **self-fix system** and full **Telegram dashboard** (16 commands).
 
 [![CI](https://github.com/rygroup-dev/owntown-farming-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/rygroup-dev/owntown-farming-bot/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-43853d?logo=node.js&logoColor=white)](https://nodejs.org)
@@ -19,7 +19,7 @@ Mining · Fishing · Combat · PvP · Marketplace · Banking · Crafting — plu
 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
-The installer asks for **two things only** — your wallet **passphrase** (Solana private key, base58) and your **Telegram bot token** — then it clones, installs deps, writes a locked-down `.env`, derives your wallet address, auto-generates dashboard credentials, and starts the bot as a service.
+The installer asks for **two things only** — your wallet **passphrase** (Solana private key, base58) and your **Telegram bot token** — then it clones, installs deps, writes a locked-down `.env`, derives your wallet address, and starts the bot as a service.
 
 Prefer non-interactive? Pass them inline:
 
@@ -94,10 +94,13 @@ A three-layer system so problems are never silently missed and recurring ones ge
 
 Inspect it live with `/selfix` and `/errors` on Telegram. Run the unit suite with `npm test`.
 
-### 📱 Telegram Control + Web Dashboard
-- Full command set: `/status` (split errors/reconnects/wrongzone), `/balance`, `/inventory`, `/income`, `/health`, `/errors`, `/selfix`, `/schedule`, `/daily`, `/pause` `/resume`, `/start` `/stop`, `/restart`, `/help`.
+### 📱 Telegram Dashboard (16 Commands)
+Full dashboard via Telegram — no web panel needed:
+- **Dashboard**: `/status` `/balance` `/daily` `/income` `/wallet`
+- **Activity**: `/inventory` `/market` `/trades` `/listings` `/map`
+- **Control**: `/start` `/stop` `/pause` `/resume` `/reauth` `/restart` `/update`
+- **System**: `/health` `/errors` `/selfix` `/schedule` `/settings` `/log` `/ping`
 - Profit & sales digests, level-up / boss / funding alerts, balance-drop watcher.
-- Web dashboard on port 8899 (cookie login) with live mini-map, profit chart, inventory & trade tabs.
 
 ## 📊 API Endpoints Used
 
@@ -156,7 +159,7 @@ npm install
 # Configure
 cp .env.example .env
 # Edit .env: set WALLET_PRIVATE_KEY (passphrase) and TELEGRAM_BOT_TOKEN
-# (WALLET_ADDRESS auto-derives; dashboard key/pass can be left for you to set)
+# (WALLET_ADDRESS auto-derives on first run)
 
 # Run
 npm start          # or: npm test  to run the unit suite
@@ -244,6 +247,5 @@ MIT — See [LICENSE](LICENSE)
 <div align="center">
 
 **RY GROUP** — packaged, hardened & maintained distribution
-Original bot foundations by [@itseywacc](https://x.com/itseywacc) · MIT
 
 </div>

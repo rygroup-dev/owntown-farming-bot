@@ -11,7 +11,7 @@ Restart=always
 RestartSec=5
 # stop hammering if it crashes in a tight loop, but never give up permanently
 StartLimitIntervalSec=0
-# bot keeps its own file at /tmp/owntown_v23.log; service stream goes to journald
+# bot keeps its own file at /tmp/owntown_v24.log; service stream goes to journald
 StandardOutput=journal
 StandardError=journal
 Environment=NODE_ENV=production
