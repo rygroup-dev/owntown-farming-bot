@@ -116,8 +116,8 @@ UNIT
   ok "service enabled & started — logs: journalctl -u owntown-bot.service -f"
 else
   warn "systemd not available — starting in background with nohup"
-  nohup node bot.js >/tmp/owntown_v24.log 2>&1 &
-  ok "started (pid $!) — logs: tail -f /tmp/owntown_v23.log"
+  nohup node bot.js >/tmp/owntown_v25.log 2>&1 &
+  ok "started (pid $!) — logs: tail -f /tmp/owntown_v25.log"
 fi
 
 cat <<DONE
@@ -125,8 +125,8 @@ cat <<DONE
 ${c_grn}════════════════════════════════════════════════════════${c_rst}
  ${c_grn}RY GROUP — Owntown Bot is live!${c_rst}
   • Telegram  : open your bot and send  /start   (learns your chat id)
-  • Dashboard : all via Telegram — /status /balance /income /market
-  • Commands  : /help for full list (16 commands)
+  • Dashboard : all via Telegram — /status /balance /income /market /quest /candy
+  • Commands  : /help for full list (28 commands)
   • Fund your wallet with >= 5000 OTWN to enter Player Mode.
 ${c_grn}════════════════════════════════════════════════════════${c_rst}
 DONE
