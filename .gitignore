@@ -3,6 +3,7 @@ node_modules/
 *.log
 *.json
 !package.json
-
-# self-fix runtime artifacts
+*.txt
+*.bak
+*.tmp
 .autopatch-backups/
