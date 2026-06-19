@@ -5,8 +5,6 @@ const nacl = require('tweetnacl');
 const bs58 = require('bs58').default || require('bs58');
 const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
-const { startDashboard } = require('./dashboard');
-const crypto = require('crypto');
 const { ErrorBus } = require('./errorbus');
 const selfheal = require('./selfheal');
 const path = require('path');
@@ -153,8 +151,8 @@ function scheduleStart(ms) {
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
-log('=== OWNTOWN PROFIT FARMER v23.0 ===');
-log('FULL FEATURED: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Sell');
+log('=== OWNTOWN PROFIT FARMER v24.0 ===');
+log('FULL FEATURED: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Sell + Telegram Dashboard');
 
 // ============ CONSTANTS ============
 const WALK_SPEED = 0.4;
@@ -951,8 +949,8 @@ function freshSell(sock, cb) {
       return;
     }
     const m = toMarket[idx];
-    sock.emit('marketplace:list', { instanceId: m.instanceId, qty: 1, price: m.price });
-    log(`📋 ${m.defId} @${m.price} (best:${m.marketBest})`);
+    sock.emit('marketplace:list', { instanceId: m.instanceId, qty: m.qty, price: m.price * m.qty });
+    log(`📋 ${m.defId} x${m.qty} @${m.price}/ea total:${m.price * m.qty} (best:${m.marketBest})`);
     setTimeout(() => listNext(idx + 1), MARKET_INTERVAL);
   }
 
@@ -1051,12 +1049,6 @@ function doActions(sock, type) {
         sock.emit('fishing:cast', { spotId: 'fish_dock' });
         lastCatchTime = Date.now();
         count++;
-      } else {
-        if(Date.now() - lastCatchTime > FISHING_TIMEOUT) {
-          log(`🎣 STUCK — force reset`);
-          fishingActive = false;
-          stats.fishingTimeouts++;
-        }
       }
     }
     else if(type === 'combat') {
@@ -1400,7 +1392,6 @@ async function startBot() {
   socket.on('shop:result', (d) => {
     if(d.ok) {
       log(`🛒 Shop OK: ${d.item || d.action || 'bought'}`);
-      stats.itemsBought++;
     } else {
       log(`🛒 Shop fail: ${d.code || d.message}`);
     }
@@ -1419,7 +1410,6 @@ async function startBot() {
   // === PORTAL ===
   socket.on('portal:enter', (d) => {
     log(`🌀 Portal entered: ${d.destination || d.zone || '?'}`);
-    stats.portalEntries++;
   });
 
   // === NOTIFICATIONS (v23: NEW!) ===
@@ -1446,7 +1436,6 @@ async function startBot() {
 
   // === CRAFTING ===
   socket.on('inventory:craft', (d) => {
-    stats.crafted++;
     log(`🔨 Crafted: ${JSON.stringify(d).substring(0, 100)}`);
   });
 
@@ -1457,15 +1446,13 @@ async function startBot() {
   socket.on('marketplace:result', (d) => {
     log(`🔍 MKT result: ${JSON.stringify(d).substring(0, 300)}`);
     if(d.ok) {
-      if(d.action === 'cancel') { stats.canceled++; log(`✅ Canceled`); }
+      if(d.action === 'cancel') { log(`✅ Canceled`); }
       else if(d.credited) {
         const defId = d.defId || d.itemId || 'quicksell';
         const qty = d.count || d.qty || 1;
         recordSale(defId, qty, 'quickSell', d.credited);
       }
-      // v23: Track buy results
       if(d.action === 'buy' && d.listingId) {
-        stats.itemsBought++;
         log(`🛒 Bought listing ${d.listingId}`);
       }
     } else log(`💰 Fail: ${d.code || d.message}`);
@@ -1557,11 +1544,13 @@ async function startBot() {
   });
 
   socket.on('connect_error', (err) => {
-    log('⚠️ connect_error: ' + (err && err.message || err));
+    const msg = (err && err.message) || 'connect_error';
+    log('⚠️ connect_error: ' + msg);
     if (stopped) return;
-    reportError({ code: (err && err.message) || 'connect_error', context: 'connect_error', category: 'reconnect' });
-    // clear token so the next attempt re-authenticates (covers stale/expired/rejected tokens)
-    token = null;
+    reportError({ code: msg, context: 'connect_error', category: 'reconnect' });
+    if (/auth|token|unauthorized|forbidden|403|401/i.test(msg)) {
+      token = null;
+    }
     try { socket.disconnect(); } catch {}
     scheduleStart(5000);
   });
@@ -1615,64 +1604,11 @@ function fmtUptime(ms) {
   const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
   return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm';
 }
-function getSnapshot() {
-  const p = getProfitSummary();
-  const market = Object.entries(marketPrices).filter(([k]) => PRICE_FLOOR[k])
-    .map(([k, v]) => { const t = getPriceTrend(k); const i = t === 'rising' ? '📈' : t === 'falling' ? '📉' : '➡️'; return `${k.replace('mat_', '').replace('fish_', '')}:${v}${i}`; }).join('  ');
-  return {
-    connected, paused, uptime: fmtUptime(Date.now() - stats.startTime),
-    wallet: WALLET_ADDR, balance, dailyEarned, dailyCap: DAILY_EARN_CAP, bankBalance: stats.bankBalance,
-    totalEarned: p.totalEarned, rate: p.rate, earnedQuick: stats.earnedQuick, earnedMarket: stats.earnedMarket,
-    pvpEarnings: stats.pvpEarnings, itemsSold: stats.totalItemsSold,
-    level, xp: stats.xp, hp, maxHp, stamina, zone, invCount: inventory.length, carryCap: CARRY_CAP,
-    activity: paused ? 'paused' : (stopped ? 'stopped (manual play)' : (connected ? currentActivity : 'offline')),
-    posX: Math.round(pos.x), posZ: Math.round(pos.z),
-    node: MINING_NODES[stats.currentNodeIdx % MINING_NODES.length].id,
-    monster: MONSTERS[stats.currentMonsterIdx % MONSTERS.length].id,
-    nodeIdx: stats.currentNodeIdx % MINING_NODES.length,
-    monIdx: stats.currentMonsterIdx % MONSTERS.length,
-    map: {
-      zones: Object.entries(ZONE_TARGETS).map(([name, p]) => ({ name, x: p.x, z: p.z })),
-      nodes: MINING_NODES.map(n => ({ x: n.pos.x, z: n.pos.z })),
-      monsters: MONSTERS.map(m => ({ x: m.pos.x, z: m.pos.z })),
-    },
-    mined: stats.mined, fished: stats.fished, kills: stats.kills, flips: stats.itemsBought,
-    crafted: stats.crafted, bossClaims: stats.bossClaims, errors: stats.errors,
-    market, log: LOG_RING.slice(-60), hourly: getHourly(12),
-    schedule: schedStatus(), errorsStreak: stats.consecutiveErrors,
-    memMB: Math.round(process.memoryUsage().rss / 1048576),
-    propertyEarnings: stats.propertyEarnings, bankBal: stats.bankBalance,
-    canceled: stats.canceled, listed: stats.listed, repaired: stats.repaired,
-    inventory: inventory.map(i => ({ name: cleanName(i.defId), defId: i.defId, qty: i.qty, value: (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty })),
-    trades: tradeLog.slice(-50).reverse().map(r => ({ t: r.t, name: cleanName(r.defId), qty: r.qty, method: r.method, price: r.price, total: r.total })),
-    listings: myActiveListings.map(l => ({ name: cleanName(l.defId), qty: l.qty || 1, price: l.price, total: l.price })),
-    settings: {
-      schedule: scheduleActive ? config.scheduleRaw : 'off',
-      jitter: config.scheduleJitterPct,
-      reportMin: config.reportIntervalMin,
-      watchdogMin: config.watchdogStuckMin,
-      profitOnly: config.notifyProfitOnly,
-      dailyCap: DAILY_EARN_CAP,
-      flip: config.flipEnabled ? `< ${Math.round(config.flipUnderprice*100)}% mkt, max ${config.flipMaxCost}, cd ${config.flipCooldownSec}s` : 'off',
-      reserve: config.balanceReserve,
-      powerup: config.powerupEnabled ? 'on' : 'off',
-      buyCap: config.dailyBuyCap,
-    },
-    buySpent: buySpentToday,
-  };
-}
-
-// generate + persist a dashboard access key + login password if none set
-let DASH_KEY = config.dashboardKey;
-if (!DASH_KEY) { DASH_KEY = crypto.randomBytes(8).toString('hex'); persistEnv('DASHBOARD_KEY', DASH_KEY); }
-let DASH_PASS = config.dashPass;
-if (!DASH_PASS) { DASH_PASS = crypto.randomBytes(6).toString('base64url'); persistEnv('DASH_PASS', DASH_PASS); log(`🖥️ Dashboard login → user: ${config.dashUser}  pass: ${DASH_PASS}`); }
-startDashboard({ port: config.dashboardPort, key: DASH_KEY, user: config.dashUser, pass: DASH_PASS, getSnapshot, logger: log });
-
 // ============ STATUS REPORT (configurable interval) ============
 setInterval(() => {
-  log('\n' + buildStatusText().replace(/<[^>]+>/g, '') + '\n');
-  notify(buildStatusText());
+  const statusText = buildStatusText();
+  log('\n' + statusText.replace(/<[^>]+>/g, '') + '\n');
+  notify(statusText);
 }, Math.max(1, config.reportIntervalMin) * 60000);
 
 // ============ DAILY REPORT (once / 24h, or via /daily) ============
@@ -1753,30 +1689,46 @@ setInterval(() => {
 }, 60000);
 
 // ============ TELEGRAM COMMANDS ============
+const esc = s => String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+
 tg.on('help', () => notify([
-  '<b>Owntown Bot — commands</b>',
+  '🏭 <b>OWNTOWN BOT v24 — Telegram Dashboard</b>',
+  '',
+  '📊 <b>Dashboard</b>',
+  '/status — full dashboard (wallet+profit+char+system)',
+  '/balance — saldo detail + locked + bank + daily cap',
+  '/daily — laporan harian (earned/spent/net)',
+  '/income — rincian pendapatan + grafik per jam',
+  '/wallet — info wallet + address',
+  '',
+  '🎮 <b>Activity</b>',
+  '/inventory — isi tas + estimasi nilai',
+  '/market — harga pasar terkini + tren',
+  '/trades — riwayat transaksi terakhir',
+  '/listings — listing aktif di marketplace',
+  '/map — posisi + zone + node/monster saat ini',
+  '',
+  '⚙️ <b>Control</b>',
   '/start — bot ON (connect + farming)',
-  '/stop — bot OFF (lepas sesi, buat main manual)',
-  '/status — ringkasan stats live',
-  '/dashboard — link panel web',
-  '/balance — saldo + locked + bank',
-  '/daily — ringkasan harian (earned/spent/net)',
-  '/log [n] — log terakhir (default 15)',
+  '/stop — bot OFF (lepas sesi, main manual)',
   '/pause — jeda farming (tetap connect)',
   '/resume — lanjut farming',
-  '/inventory — isi tas',
-  '/income — rincian pendapatan',
-  '/health — kesehatan sistem',
-  '/errors — error terakhir',
-  '/selfix — status self-fix system',
-  '/schedule — jadwal anti-detect',
-  '/ping — cek bot hidup',
-  '/restart — restart proses',
-  '/update — pull update code + restart',
   '/reauth — login ulang ke game',
+  '/restart — restart proses',
+  '/update — pull code terbaru + restart',
+  '',
+  '🔧 <b>System</b>',
+  '/health — kesehatan sistem lengkap',
+  '/errors — error terakhir + KB signatures',
+  '/selfix — status self-fix + autopatch',
+  '/schedule — jadwal anti-detect',
+  '/settings — konfigurasi aktif',
+  '/log [n] — log terakhir (default 15, max 50)',
+  '/ping — cek bot hidup',
   '',
   '<i>⚠️ 1 wallet = 1 sesi. Mau main manual? /stop dulu.</i>',
 ].join('\n')));
+
 tg.on('start', () => {
   paused = false; stopped = false;
   if (connected) { notify('▶️ Already farming. /status for stats.'); return; }
@@ -1791,64 +1743,206 @@ tg.on('stop', () => {
   notify('⏹️ <b>Bot OFF</b> — sesi game dilepas.\nSekarang kamu bebas main manual pakai wallet ini. Ketik /start kalau mau bot lanjut lagi.');
   log('⏹️ Stopped via Telegram (manual play mode)');
 });
-let publicIp = '';
-function getPublicIp() {
-  return new Promise((resolve) => {
-    https.get('https://api.ipify.org', (r) => { let d = ''; r.on('data', c => d += c); r.on('end', () => resolve(d.trim())); })
-      .on('error', () => resolve('')).setTimeout(8000, function () { this.destroy(); resolve(''); });
-  });
-}
-tg.on('dashboard', async () => {
-  if (!publicIp) publicIp = await getPublicIp();
-  const host = publicIp || 'YOUR_VPS_IP';
-  const link = `http://${host}:${config.dashboardPort}/?key=${DASH_KEY}`;
-  notify(`🖥️ <b>Dashboard</b>\n${link}\n\n(Live: wallet, saldo, profit, market, log — auto-refresh 5s)`);
+
+tg.on('status', () => {
+  const p = getProfitSummary();
+  const conn = connected ? '🟢' : '🔴';
+  const state = paused ? '⏸️ paused' : stopped ? '⏹️ stopped' : (connected ? '▶️ farming' : '⏳ offline');
+  const up = fmtUptime(Date.now() - stats.startTime);
+  const mem = process.memoryUsage();
+  const invVal = inventory.reduce((s, i) => s + (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty, 0);
+  notify([
+    `${conn} <b>OWNTOWN BOT</b> · ${state}`,
+    `<i>⏱ ${up}  ·  📍 ${zone}  ·  🧍 Lv ${level}</i>`,
+    '',
+    `💰 <b>Wallet & Profit</b>`,
+    '<pre>' +
+      `Balance     ${fmt(Math.round(balance))} OTWN\n` +
+      `Locked      ${fmt(lockedBalance)}\n` +
+      `Bank        ${fmt(stats.bankBalance)}\n` +
+      `Daily       ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}\n` +
+      `───────────────────────\n` +
+      `Total earn  ${fmt(p.totalEarned)} OTWN\n` +
+      `Rate        ${fmt(p.rate)} /h\n` +
+      `QuickSell   +${fmt(stats.earnedQuick)}\n` +
+      `Market      +${fmt(stats.earnedMarket)}\n` +
+      `PvP         +${fmt(stats.pvpEarnings)}\n` +
+      `Items sold  ${fmt(p.itemsSold)}` +
+    '</pre>',
+    '',
+    `🧍 <b>Character</b>`,
+    `❤️ ${hp}/${maxHp}  ⚡ ${stamina}  📦 ${inventory.length}/${CARRY_CAP} (~${fmt(invVal)} OTWN)`,
+    '',
+    `🎯 <b>Activity Stats</b>`,
+    `⛏ ${fmt(stats.mined)}  🎣 ${fmt(stats.fished)}  ⚔ ${fmt(stats.kills)}  🔨 ${fmt(stats.crafted)}  👹 ${fmt(stats.bossClaims)}`,
+    `🛒 bought:${fmt(stats.itemsBought)}  🔄 flips:${fmt(stats.itemsFlipped)}  +${fmt(stats.flipProfit)} flip profit`,
+    '',
+    `🔧 <b>System</b>`,
+    `${stats.errors ? '⚠️' : '✅'} errors:${stats.errors} streak:${stats.consecutiveErrors}  🔌 reconn:${stats.reconnects||0}  🌀 wrongzone:${stats.wrongZone}`,
+    `📊 sched: ${schedStatus()}  💾 ${(mem.rss/1048576).toFixed(0)} MB`,
+  ].join('\n'));
 });
-tg.on('status', () => notify(buildStatusText()));
-tg.on('stats', () => notify(buildStatusText()));
-tg.on('balance', () => notify(`💰 Balance: <b>${balance.toFixed(2)}</b> OTWN\n🔒 Locked: ${lockedBalance}\n🏦 Bank withdrawable: ${stats.bankBalance}\n📅 Daily earned: ${dailyEarned}/${DAILY_EARN_CAP}`));
+tg.on('stats', () => tg.handlers['status']());
+
+tg.on('balance', () => {
+  const p = getProfitSummary();
+  notify([
+    `💰 <b>Balance Detail</b>`,
+    '<pre>' +
+    `Spendable    ${fmt(Math.round(balance))} OTWN\n` +
+    `Locked       ${fmt(lockedBalance)} (listing/escrow)\n` +
+    `Bank         ${fmt(stats.bankBalance)}\n` +
+    `Withdrawable ${fmt(withdrawableBalance)}\n` +
+    `Reserve      ${fmt(config.balanceReserve)} (jangan dipakai)\n` +
+    `───────────────────────\n` +
+    `Daily earned ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}\n` +
+    `Buy spent    ${fmt(buySpentToday)} / ${fmt(config.dailyBuyCap)}\n` +
+    `Total earned ${fmt(p.totalEarned)} OTWN` +
+    '</pre>',
+  ].join('\n'));
+});
+
 tg.on('daily', () => notify(buildDailyReport()));
+
+tg.on('income', () => {
+  const p = getProfitSummary();
+  const hrs = getHourly(12).map(h => `${h.h}:00  ${h.v > 0 ? '█'.repeat(Math.min(12, Math.ceil(h.v / (Math.max(1, ...getHourly(12).map(x=>x.v)) / 12)))) : '·'}  +${fmt(h.v)}`).join('\n');
+  notify([
+    `💵 <b>Income Breakdown</b>`,
+    '<pre>' +
+    `Total      ${fmt(p.totalEarned)} OTWN\n` +
+    `Rate       ${fmt(p.rate)} /h\n` +
+    `───────────────────────\n` +
+    `QuickSell  +${fmt(stats.earnedQuick)}\n` +
+    `Market     +${fmt(stats.earnedMarket)}\n` +
+    `PvP        +${fmt(stats.pvpEarnings)}\n` +
+    `Property   +${fmt(stats.propertyEarnings)}\n` +
+    `Flip prof  +${fmt(stats.flipProfit)}\n` +
+    `───────────────────────\n` +
+    `Sold       ${fmt(p.itemsSold)} items\n` +
+    `Held       ${fmt(stats.holdCount)} items (~${fmt(stats.holdValue)} OTWN)` +
+    '</pre>',
+    '',
+    `📈 <b>Per jam (12h)</b>`,
+    `<pre>${hrs}</pre>`,
+  ].join('\n'));
+});
+
+tg.on('wallet', () => {
+  notify([
+    `🔑 <b>Wallet Info</b>`,
+    `<code>${WALLET_ADDR || '(auto-derive on connect)'}</code>`,
+    ``,
+    `💰 ${fmt(Math.round(balance))} OTWN spendable`,
+    `🔒 ${fmt(lockedBalance)} locked`,
+    `🏦 ${fmt(stats.bankBalance)} in bank`,
+  ].join('\n'));
+});
+
+tg.on('market', () => {
+  if (!Object.keys(marketPrices).length) { notify('📊 Belum ada data market. Tunggu cycle sell berikutnya.'); return; }
+  const rows = Object.entries(marketPrices)
+    .filter(([k]) => PRICE_FLOOR[k])
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => {
+      const t = getPriceTrend(k);
+      const icon = t === 'rising' ? '📈' : t === 'falling' ? '📉' : '➡️';
+      const depth = getMarketDepth(k);
+      const floor = PRICE_FLOOR[k] || 0;
+      const name = cleanName(k).padEnd(18).slice(0, 18);
+      return `${name} ${fmt(v).padStart(6)}  ${icon} ${String(depth).padStart(2)} listings  floor:${floor}`;
+    }).join('\n');
+  notify(`📊 <b>Market Prices</b>\n<pre>${rows}</pre>\n<i>Update setiap sell cycle</i>`);
+});
+
+tg.on('trades', () => {
+  if (!tradeLog.length) { notify('🧾 Belum ada transaksi.'); return; }
+  const rows = tradeLog.slice(-20).reverse().map(r => {
+    const t = new Date(r.t).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+    const m = r.method === 'quickSell' ? 'QS' : 'MK';
+    const name = cleanName(r.defId).padEnd(14).slice(0, 14);
+    return `${t} ${m} ${name} x${String(r.qty).padStart(2)} +${fmt(r.total)}`;
+  }).join('\n');
+  const p = getProfitSummary();
+  notify(`🧾 <b>Transaksi Terakhir</b> (${tradeLog.length} total)\n<pre>${rows}</pre>\n💰 Total: ${fmt(p.totalEarned)} OTWN · ${fmt(p.rate)}/h`);
+});
+
+tg.on('listings', () => {
+  if (!myActiveListings.length) { notify('🏷️ Tidak ada listing aktif.'); return; }
+  const rows = myActiveListings.map(l => {
+    const name = cleanName(l.defId).padEnd(16).slice(0, 16);
+    return `${name} x${String(l.qty || 1).padStart(2)}  @${fmt(l.price)}`;
+  }).join('\n');
+  const total = myActiveListings.reduce((s, l) => s + l.price, 0);
+  notify(`🏷️ <b>Listing Aktif</b> (${myActiveListings.length})\n<pre>${rows}\n────────────────────\nTotal nilai: ${fmt(total)} OTWN</pre>`);
+});
+
+tg.on('map', () => {
+  const node = MINING_NODES[stats.currentNodeIdx % MINING_NODES.length];
+  const mon = MONSTERS[stats.currentMonsterIdx % MONSTERS.length];
+  notify([
+    `🗺️ <b>Position & Zone</b>`,
+    `📍 Zone: <b>${zone}</b>`,
+    `📌 Pos: (${Math.round(pos.x)}, ${Math.round(pos.z)})`,
+    `🎯 Activity: <b>${currentActivity}</b>`,
+    '',
+    '<pre>' +
+    `Mining node  ${node.id} (${node.pos.x},${node.pos.z})\n` +
+    `Monster      ${mon.id} [${mon.defId}] (${mon.pos.x},${mon.pos.z})\n` +
+    `Node idx     ${stats.currentNodeIdx % MINING_NODES.length}/${MINING_NODES.length}\n` +
+    `Monster idx  ${stats.currentMonsterIdx % MONSTERS.length}/${MONSTERS.length}` +
+    '</pre>',
+  ].join('\n'));
+});
+
 tg.on('log', (args) => {
   const n = Math.min(50, Math.max(1, parseInt(args[0] || '15', 10) || 15));
   const lines = LOG_RING.slice(-n).join('\n') || '(no logs yet)';
-  notify('<pre>' + lines.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>');
+  notify('<pre>' + esc(lines) + '</pre>');
 });
+tg.on('logs', (a) => tg.handlers['log'](a));
+
 tg.on('pause', () => { paused = true; log('⏸️ Paused via Telegram'); notify('⏸️ Farming <b>paused</b>. /resume to continue.'); });
 tg.on('resume', () => {
   if (!paused) { notify('▶️ Already running.'); return; }
   paused = false; log('▶️ Resumed via Telegram'); notify('▶️ Farming <b>resumed</b>.');
   if (activeSocket && activeSocket.connected) runNextCycle(activeSocket);
 });
+
 tg.on('reauth', () => {
   notify('🔑 Re-authenticating...'); token = null;
   try { if (activeSocket) activeSocket.disconnect(); } catch {}
   setTimeout(startBot, 1500);
 });
 tg.on('ping', () => notify(`🏓 <b>pong</b> · ${connected ? '🟢 online' : '🔴 offline'} · ⏱ ${fmtUptime(Date.now() - stats.startTime)}`));
-tg.on('logs', (a) => tg.handlers['log'](a));
+
 tg.on('schedule', () => {
   const list = schedulePhases.map((p, i) => `${i === schedIdx ? '▶️' : '  '} ${p.state.toUpperCase()} ${p.hours}j`).join('\n');
-  notify(`🗓️ <b>Anti-detect schedule</b>\n${scheduleActive ? schedStatus() : 'disabled'}\n<pre>${list || 'none'}</pre>`);
+  notify(`🗓️ <b>Anti-detect Schedule</b>\n${scheduleActive ? schedStatus() : 'disabled'}\n<pre>${list || 'none'}</pre>`);
 });
+
 tg.on('health', () => {
   const mem = process.memoryUsage();
   const idleM = Math.round((Date.now() - lastActivity) / 60000);
   notify([
-    `🩺 <b>Health</b>`,
+    `🩺 <b>System Health</b>`,
     '<pre>' +
     `Game       ${connected ? 'OK 🟢' : 'DOWN 🔴'}\n` +
     `Telegram   ${tg.enabled ? 'OK 🟢' : 'DOWN 🔴'}\n` +
-    `Token      ${token && !isTokenExpired(token) ? 'valid' : 'stale'}\n` +
+    `Token      ${token && !isTokenExpired(token) ? 'valid ✅' : 'stale ⚠️'}\n` +
     `Idle       ${idleM}m (watchdog @${config.watchdogStuckMin}m)\n` +
     `Errors     ${stats.errors} (streak ${stats.consecutiveErrors})\n` +
+    `Reconnects ${stats.reconnects || 0}\n` +
+    `Wrong zone ${stats.wrongZone}\n` +
     `Schedule   ${schedStatus()}\n` +
-    `Memory     ${(mem.rss/1048576).toFixed(0)} MB\n` +
-    `Uptime     ${fmtUptime(Date.now() - stats.startTime)}` +
+    `Memory     ${(mem.rss/1048576).toFixed(0)} MB (heap ${(mem.heapUsed/1048576).toFixed(0)}/${(mem.heapTotal/1048576).toFixed(0)})\n` +
+    `Uptime     ${fmtUptime(Date.now() - stats.startTime)}\n` +
+    `Node       ${process.version}` +
     '</pre>',
   ].join('\n'));
 });
+
 tg.on('errors', () => {
-  const esc = s => s.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
   const errs = LOG_RING.filter(l => /ERR|❌|💥|⚠️|fail/i.test(l)).slice(-12);
   const top = errorBus.top(5).map(e => `${e.code} ×${e.count} [${e.status}]${e.lastAction ? ' ' + e.lastAction : ''}`);
   notify(
@@ -1856,54 +1950,72 @@ tg.on('errors', () => {
     '<b>Recent log</b>\n<pre>' + (esc(errs.join('\n')) || 'none 🎉') + '</pre>'
   );
 });
+
 tg.on('selfix', () => {
-  const esc = s => s.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
   const top = errorBus.top(5).map(e => `${e.code} ×${e.count} [${e.status}]`);
   let pend = 'none'; try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')).recipe; } catch {}
   let backups = 0; try { backups = fs.readdirSync(BACKUP_DIR).length; } catch {}
   notify([
-    '🩺 <b>Self-Fix</b>',
-    '<pre>',
-    `Blacklisted zones   ${esc(ZONE_BLACKLIST.join(', ') || 'none')}`,
-    `Reconnect backoff   ${RECONNECT_BACKOFF_MS}ms`,
-    `Pending patch       ${pend}`,
-    `Backups kept        ${backups}`,
-    `KB signatures       ${errorBus.all().length}`,
+    '🩺 <b>Self-Fix System</b>',
+    '<pre>' +
+    `Blacklisted zones   ${esc(ZONE_BLACKLIST.join(', ') || 'none')}\n` +
+    `Reconnect backoff   ${RECONNECT_BACKOFF_MS}ms\n` +
+    `Pending patch       ${pend}\n` +
+    `Backups kept        ${backups}\n` +
+    `KB signatures       ${errorBus.all().length}` +
     '</pre>',
     '<b>Top signatures</b>',
     '<pre>' + (esc(top.join('\n')) || 'none') + '</pre>',
   ].join('\n'));
 });
+
 tg.on('inventory', () => {
   if (!inventory.length) { notify('🎒 Inventory kosong.'); return; }
-  const rows = inventory.slice(0, 30).map(i => {
+  const sorted = [...inventory].sort((a, b) => {
+    const va = (PRICE_FLOOR[a.defId] || QUICKSELL[a.defId] || 0) * a.qty;
+    const vb = (PRICE_FLOOR[b.defId] || QUICKSELL[b.defId] || 0) * b.qty;
+    return vb - va;
+  });
+  const rows = sorted.slice(0, 30).map(i => {
     const val = (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty;
-    return `${(i.defId.replace(/^(mat_|fish_|wpn_|tool_|cos_|food_|med_|kit_|pet_|permit_)/, '')).padEnd(16).slice(0,16)} x${String(i.qty).padStart(3)}  ~${val}`;
+    const keep = KEEP.has(i.defId) ? '🔒' : '  ';
+    return `${keep}${cleanName(i.defId).padEnd(15).slice(0,15)} x${String(i.qty).padStart(3)}  ~${fmt(val)}`;
   }).join('\n');
-  notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP})\n<pre>${rows}</pre>`);
+  const totalVal = inventory.reduce((s, i) => s + (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty, 0);
+  notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP}) · ~${fmt(totalVal)} OTWN\n<pre>${rows}</pre>\n🔒 = keep (tidak dijual)`);
 });
-tg.on('income', () => {
-  const p = getProfitSummary();
-  const hrs = getHourly(6).map(h => `${h.h}:00  +${fmt(h.v)}`).join('\n');
+
+tg.on('settings', () => {
   notify([
-    `💵 <b>Income</b>`,
+    `⚙️ <b>Konfigurasi Aktif</b>`,
     '<pre>' +
-    `Total      ${fmt(p.totalEarned)} OTWN\n` +
-    `Rate       ${fmt(p.rate)} /h\n` +
-    `QuickSell  +${fmt(stats.earnedQuick)}\n` +
-    `Market     +${fmt(stats.earnedMarket)}\n` +
-    `PvP        +${fmt(stats.pvpEarnings)}\n` +
-    `Property   +${fmt(stats.propertyEarnings)}\n` +
-    `Sold       ${fmt(p.itemsSold)} items` +
+    `Schedule        ${scheduleActive ? config.scheduleRaw : 'off'}\n` +
+    `Jitter          ±${config.scheduleJitterPct}%\n` +
+    `Report interval ${config.reportIntervalMin} min\n` +
+    `Watchdog        ${config.watchdogStuckMin} min\n` +
+    `Notif profit    ${config.notifyProfitOnly ? 'ON' : 'OFF'}\n` +
+    `Daily earn cap  ${fmt(DAILY_EARN_CAP)}\n` +
+    `───────────────────────\n` +
+    `Flip            ${config.flipEnabled ? 'ON' : 'OFF'}\n` +
+    `Flip underprice <${Math.round(config.flipUnderprice*100)}% market\n` +
+    `Flip max cost   ${fmt(config.flipMaxCost)}\n` +
+    `Flip cooldown   ${config.flipCooldownSec}s\n` +
+    `Flip min profit ${fmt(config.flipMinProfit)}\n` +
+    `Balance reserve ${fmt(config.balanceReserve)}\n` +
+    `Daily buy cap   ${fmt(config.dailyBuyCap)}\n` +
+    `Powerup         ${config.powerupEnabled ? 'ON' : 'OFF'}\n` +
+    `Buy spent today ${fmt(buySpentToday)} / ${fmt(config.dailyBuyCap)}` +
     '</pre>',
-    `<i>Per jam (6h):</i>\n<pre>${hrs}</pre>`,
+    '<i>Edit .env di VPS lalu /restart</i>',
   ].join('\n'));
 });
+
 tg.on('restart', () => { notify('♻️ Restarting process...'); setTimeout(() => process.exit(0), 800); });
 tg.on('update', () => {
   notify('⬇️ Pulling latest code from git...');
-  require('child_process').exec('git -C ' + __dirname + ' pull --ff-only 2>&1', (err, out) => {
-    notify('<pre>' + String(out || err).slice(0, 600).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>');
+  const { execFile } = require('child_process');
+  execFile('git', ['-C', __dirname, 'pull', '--ff-only'], (err, out, stderr) => {
+    notify('<pre>' + esc(String(out || stderr || err).slice(0, 600)) + '</pre>');
     if (!err) { notify('♻️ Restarting with new code...'); setTimeout(() => process.exit(0), 1000); }
   });
 });
@@ -1975,8 +2087,8 @@ setInterval(() => {
 }, 30000);
 
 // ============ BOOT ============
-log('🚀 Starting v23 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram + Autopilot...');
+log('🚀 Starting v24 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram Dashboard + Autopilot...');
 verifyPendingPatchOnBoot();
 tg.startPolling();
-notifySys('🚀 <b>Owntown Bot</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /dashboard untuk panel live</i>');
+notifySys('🚀 <b>Owntown Bot v24</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /status untuk dashboard live</i>');
 startBot();

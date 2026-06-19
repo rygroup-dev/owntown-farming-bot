@@ -51,9 +51,6 @@ const config = {
   telegramToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
 
-  // Dashboard
-  dashboardPort: parseInt(process.env.DASHBOARD_PORT || '8899', 10),
-  dashboardKey: process.env.DASHBOARD_KEY || '',
 
   // Behaviour
   gameHost: process.env.GAME_HOST || 'owntown.fun',
@@ -64,10 +61,6 @@ const config = {
   scheduleEnabled: (process.env.SCHEDULE_ENABLED || 'true').toLowerCase() === 'true',
   scheduleRaw: process.env.SCHEDULE || 'on:18,off:2,on:1,off:3',
   scheduleJitterPct: parseInt(process.env.SCHEDULE_JITTER_PCT || '12', 10), // ±% randomization per phase
-
-  // Dashboard login
-  dashUser: process.env.DASH_USER || 'admin',
-  dashPass: process.env.DASH_PASS || '',
 
   // Trading / flip strategy (measured, not reckless)
   flipEnabled: (process.env.FLIP_ENABLED || 'true').toLowerCase() === 'true',
