@@ -9,6 +9,7 @@ const path = require('path');
 const { execFile } = require('child_process');
 const { buildSellDecision, getMarketDepth, getPriceTrend } = require('./lib/market');
 const { parseSchedule } = require('./lib/schedule');
+const pkg = require('./package.json');
 
 // ============ CONFIG ============
 const TOKEN_PATH = config.tokenPath;
@@ -18,6 +19,9 @@ const WALLET_FILE = config.walletFile;
 const LOG = config.logPath;
 let MY_PLAYER_ID = config.playerId;
 try { fs.writeFileSync(LOG, ''); } catch {}
+
+const BOT_VERSION = pkg.version || '0.0.0';
+const RELEASE_CHANNEL = BOT_VERSION.startsWith('30.') ? 'v30 foundation' : `v${BOT_VERSION}`;
 
 const LOG_RING = [];
 const LOG_RING_MAX = 200;
@@ -55,13 +59,35 @@ let activeSocket = null;
 let lastCycleStart = Date.now();
 let retryTimer = null;
 let maintenanceInFlight = false;
+let nextRetryAt = 0;
+let lastDisconnectAt = 0;
+let lastDisconnectReason = 'none';
+let pauseReason = '';
 function touchActivity() { lastActivity = Date.now(); }
 function scheduleStart(ms) {
   if (retryTimer) clearTimeout(retryTimer);
+  nextRetryAt = Date.now() + Math.max(0, ms || 0);
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
-log('=== OWNTOWN SMART FARMER v25.0.3 ===');
+function fmtEta(ts) {
+  if (!ts) return '—';
+  const sec = Math.max(0, Math.round((ts - Date.now()) / 1000));
+  if (sec <= 0) return 'now';
+  const min = Math.floor(sec / 60);
+  const rem = sec % 60;
+  return min > 0 ? `${min}m ${rem}s` : `${rem}s`;
+}
+
+function runtimeModeLabel() {
+  if (stopped) return pauseReason ? `stopped (${pauseReason})` : 'stopped';
+  if (paused) return pauseReason ? `paused (${pauseReason})` : 'paused';
+  if (connected) return `active (${currentActivity})`;
+  if (retryTimer) return `reconnecting in ${fmtEta(nextRetryAt)}`;
+  return 'idle';
+}
+
+log(`=== OWNTOWN SMART FARMER v${BOT_VERSION} ===`);
 log('AUTO ORCHESTRATOR: Mining+Fishing+Combat+PvP+Quest+Candy+Market+Bank+Crafting');
 
 // ============ CONSTANTS ============
@@ -465,14 +491,14 @@ async function startBot(){
   socket.on('notifications',(d)=>{if(d.items)stats.notifications=d.items.length});
 
   socket.on('connect',()=>{
-    connected=true;touchActivity();if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
+    connected=true;touchActivity();pauseReason='';nextRetryAt=0;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
     log('Connected!');notify(`🟢 <b>Connected</b> — ${GAME_HOST}`);activeSocket=socket;
     let started=false;
     socket.on('player:correction',function onC(d){if(!started&&d.pos){pos.x=d.pos.x;pos.z=d.pos.z;started=true;socket.removeListener('player:correction',onC);log(`Pos:(${pos.x.toFixed(1)},${pos.z.toFixed(1)}) ${zoneName}`);waitInv(socket,()=>{socket.emit('economy:ledger');checkBank(token);socket.emit('property:info',{});socket.emit('candy:claim');runNextCycle(socket)})}});
     setTimeout(()=>{if(!started){started=true;waitInv(socket,()=>runNextCycle(socket))}},3000);
   });
-  socket.on('disconnect',(r)=>{log('Disconnected: '+r);connected=false;if(stopped)return;reportError({code:r,context:'disconnect',category:'reconnect'});notify(`🔴 Disconnected — reconn ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);scheduleStart(RECONNECT_BACKOFF_MS)});
-  socket.on('connect_error',(err)=>{const msg=(err&&err.message)||'connect_error';log('⚠️ '+msg);if(stopped)return;reportError({code:msg,context:'connect_error',category:'reconnect'});if(/auth|token|unauthorized|forbidden|403|401/i.test(msg))token=null;try{socket.disconnect()}catch{}scheduleStart(5000)});
+  socket.on('disconnect',(r)=>{lastDisconnectAt=Date.now();lastDisconnectReason=String(r||'disconnect');log('Disconnected: '+r);connected=false;if(stopped)return;reportError({code:r,context:'disconnect',category:'reconnect'});notify(`🔴 Disconnected — reconn ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);scheduleStart(RECONNECT_BACKOFF_MS)});
+  socket.on('connect_error',(err)=>{const msg=(err&&err.message)||'connect_error';lastDisconnectAt=Date.now();lastDisconnectReason=String(msg);log('⚠️ '+msg);if(stopped)return;reportError({code:msg,context:'connect_error',category:'reconnect'});if(/auth|token|unauthorized|forbidden|403|401/i.test(msg))token=null;try{socket.disconnect()}catch{}scheduleStart(5000)});
   function waitInv(s,cb){if(inventoryReady){cb();return}let w=0;const iv=setInterval(()=>{w+=500;if(inventoryReady||w>5000){clearInterval(iv);cb()}},500)}
 }
 
@@ -482,7 +508,7 @@ function fmtUptime(ms){const s=Math.floor(ms/1000),d=Math.floor(s/86400),h=Math.
 const esc=s=>String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
 
 // ============ REPORTS ============
-setInterval(()=>{const p=getProfitSummary();const t=[`${connected?'🟢':'🔴'} <b>v25</b> ${paused?'⏸️':connected?'▶️ '+currentActivity:'⏳'}`,`⏱${fmtUptime(Date.now()-stats.startTime)} 📍${zoneName} Lv${level}`,`💰${fmt(Math.round(balance))} earned:${fmt(p.totalEarned)} ${fmt(p.rate)}/h`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)}`].join('\n');log('\n'+t.replace(/<[^>]+>/g,'')+'\n');notify(t)},Math.max(1,config.reportIntervalMin)*60000);
+setInterval(()=>{const p=getProfitSummary();const t=[`${connected?'🟢':'🔴'} <b>v${BOT_VERSION}</b> ${paused?'⏸️':connected?'▶️ '+currentActivity:'⏳'}`,`⏱${fmtUptime(Date.now()-stats.startTime)} 📍${zoneName} Lv${level}`,`💰${fmt(Math.round(balance))} earned:${fmt(p.totalEarned)} ${fmt(p.rate)}/h`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)}`].join('\n');log('\n'+t.replace(/<[^>]+>/g,'')+'\n');notify(t)},Math.max(1,config.reportIntervalMin)*60000);
 
 let dailyBaseline=null;
 function snapDaily(){const p=getProfitSummary();dailyBaseline={t:Date.now(),balance,totalEarned:p.totalEarned,mined:stats.mined,fished:stats.fished,kills:stats.kills}}
@@ -497,7 +523,7 @@ setInterval(()=>{if(paused||stopped)return;const idle=Date.now()-lastActivity;if
 
 // ============ TELEGRAM COMMANDS ============
 tg.on('help',()=>notify([
-  '🏭 <b>OWNTOWN v25 — Smart Orchestrator</b>',
+  `🏭 <b>OWNTOWN v${BOT_VERSION} — Smart Orchestrator</b>`,
   '',
   '📊 <b>Dashboard</b>',
   '/status — full dashboard',
@@ -526,14 +552,14 @@ tg.on('help',()=>notify([
   '/reauth · /restart · /update',
   '',
   '🔧 <b>System</b>',
-  '/health · /errors · /settings',
+  '/health · /errors · /settings · /version',
   '/schedule · /log [n] · /ping',
   '',
   '<i>⚠️ 1 wallet = 1 session. Use /stop for manual play.</i>',
 ].join('\n')));
-tg.on('start',()=>{paused=false;stopped=false;if(connected){notify('▶️ Already farming.');return}notify('🚀 Connecting…');startBot()});
-tg.on('stop',()=>{stopped=true;paused=false;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false;notify('⏹️ <b>Stopped</b> — manual mode.')});
-tg.on('status',()=>{const p=getProfitSummary(),up=fmtUptime(Date.now()-stats.startTime),alive=liveMonsters.filter(m=>m.alive).length;notify([`${connected?'🟢':'🔴'} <b>OWNTOWN v25</b> · ${paused?'⏸️':stopped?'⏹️':connected?'▶️ '+currentActivity:'⏳'}`,`<i>⏱${up} · 📍${zoneName} · Lv${level} (${stats.xp}/${stats.xpForNext||'?'}XP)</i>`,'','💰 <b>Economy</b>',`<pre>Balance  ${fmt(Math.round(balance))} OTWN\nCandy    ${fmt(candyBalance)}\nChip     ${fmt(chipBalance)}\nBank     ${fmt(stats.bankBalance)}\nEarned   ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h</pre>`,'',`🧍 ❤️${hp}/${maxHp} ⚡${stamina} 📦${inventory.length}/${CARRY_CAP}`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)} 🔨${fmt(stats.crafted)} 👹${fmt(stats.bossClaims)}`,`🌍 ${serverPlayerCount} online · ${alive}/${liveMonsters.length} mobs · boss:${worldBossState?.phase||'?'}`,`📜 Quest: ${questState?.activeId||'none'} (${(questState?.completed||[]).length} done)`,`${stats.errors?'⚠️':'✅'} err:${stats.errors} reconn:${stats.reconnects||0}`].join('\n'))});
+tg.on('start',()=>{paused=false;stopped=false;pauseReason='';if(connected){notify('▶️ Already farming.');return}notify('🚀 Connecting…');startBot()});
+tg.on('stop',()=>{stopped=true;paused=false;pauseReason='manual stop';if(retryTimer){clearTimeout(retryTimer);retryTimer=null}nextRetryAt=0;try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false;notify('⏹️ <b>Stopped</b> — manual mode.')});
+tg.on('status',()=>{const p=getProfitSummary(),up=fmtUptime(Date.now()-stats.startTime),alive=liveMonsters.filter(m=>m.alive).length;notify([`${connected?'🟢':'🔴'} <b>OWNTOWN v${BOT_VERSION}</b> · ${runtimeModeLabel()}`,`<i>⏱${up} · 📍${zoneName} · Lv${level} (${stats.xp}/${stats.xpForNext||'?'}XP)</i>`,'','💰 <b>Economy</b>',`<pre>Balance  ${fmt(Math.round(balance))} OTWN\nCandy    ${fmt(candyBalance)}\nChip     ${fmt(chipBalance)}\nBank     ${fmt(stats.bankBalance)}\nEarned   ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h</pre>`,'',`🧍 ❤️${hp}/${maxHp} ⚡${stamina} 📦${inventory.length}/${CARRY_CAP}`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)} 🔨${fmt(stats.crafted)} 👹${fmt(stats.bossClaims)}`,`🌍 ${serverPlayerCount} online · ${alive}/${liveMonsters.length} mobs · boss:${worldBossState?.phase||'?'}`,`📜 Quest: ${questState?.activeId||'none'} (${(questState?.completed||[]).length} done)`,`🔁 Retry: ${fmtEta(nextRetryAt)} · Last disconnect: ${lastDisconnectReason}`,`${stats.errors?'⚠️':'✅'} err:${stats.errors} reconn:${stats.reconnects||0}`].join('\n'))});
 tg.on('stats',()=>tg.handlers['status']());
 tg.on('balance',()=>notify(`💰 <b>Balance</b>\n<pre>OTWN     ${fmt(Math.round(balance))}\nLocked   ${fmt(lockedBalance)}\nCandy    ${fmt(candyBalance)} 🍬\nChip     ${fmt(chipBalance)} 🎰\nBank     ${fmt(stats.bankBalance)}\nDaily    ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}</pre>`));
 tg.on('daily',()=>notify(buildDaily()));
@@ -683,13 +709,21 @@ tg.on('market',()=>{if(!Object.keys(marketPrices).length){notify('📊 No data.'
 tg.on('trades',()=>{if(!tradeLog.length){notify('🧾 None.');return}const rows=tradeLog.slice(-15).reverse().map(r=>`${new Date(r.t).toLocaleTimeString('id',{hour:'2-digit',minute:'2-digit'})} ${r.method==='quickSell'?'QS':'MK'} ${cleanName(r.defId).slice(0,12)} +${fmt(r.total)}`).join('\n');notify(`🧾 <b>Trades</b>\n<pre>${rows}</pre>`)});
 tg.on('listings',()=>{if(!myActiveListings.length){notify('🏷️ None.');return}const r=myActiveListings.map(l=>`${cleanName(l.defId).slice(0,14)} x${l.qty||1} @${fmt(l.price)}`).join('\n');notify(`🏷️ <b>Listings</b>\n<pre>${r}</pre>`)});
 tg.on('inventory',()=>{if(!inventory.length){notify('🎒 Empty.');return}const s=[...inventory].sort((a,b)=>((PRICE_FLOOR[b.defId]||QUICKSELL[b.defId]||0)*b.qty)-((PRICE_FLOOR[a.defId]||QUICKSELL[a.defId]||0)*a.qty));const rows=s.slice(0,25).map(i=>{const v=(PRICE_FLOOR[i.defId]||QUICKSELL[i.defId]||0)*i.qty;return`${KEEP.has(i.defId)?'🔒':'  '}${cleanName(i.defId).padEnd(13).slice(0,13)} x${String(i.qty).padStart(3)} ~${fmt(v)}`}).join('\n');const t=inventory.reduce((s,i)=>s+(PRICE_FLOOR[i.defId]||QUICKSELL[i.defId]||0)*i.qty,0);notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP}) ~${fmt(t)}\n<pre>${rows}</pre>`)});
-tg.on('health',()=>{const m=process.memoryUsage();notify(`🩺 <b>Health</b>\n<pre>Game     ${connected?'🟢':'🔴'}\nToken    ${token&&!isTokenExpired(token)?'✅':'⚠️'}\nErrors   ${stats.errors} (${stats.consecutiveErrors})\nReconns  ${stats.reconnects||0}\nSchedule ${schedStatus()}\nMemory   ${(m.rss/1048576).toFixed(0)}MB\nUptime   ${fmtUptime(Date.now()-stats.startTime)}\nWorld    ${serverPlayerCount} online\nNode     ${process.version}</pre>`)});
+tg.on('health',()=>{const m=process.memoryUsage();notify(`🩺 <b>Health</b>\n<pre>Game     ${connected?'🟢':'🔴'}\nMode     ${runtimeModeLabel()}\nToken    ${token&&!isTokenExpired(token)?'✅':'⚠️'}\nErrors   ${stats.errors} (${stats.consecutiveErrors})\nReconns  ${stats.reconnects||0}\nRetry    ${fmtEta(nextRetryAt)}\nDrop     ${lastDisconnectReason}\nSchedule ${schedStatus()}\nMemory   ${(m.rss/1048576).toFixed(0)}MB\nUptime   ${fmtUptime(Date.now()-stats.startTime)}\nWorld    ${serverPlayerCount} online\nNode     ${process.version}</pre>`)});
 tg.on('errors',()=>{const e=LOG_RING.filter(l=>/ERR|❌|💥|⚠️|fail/i.test(l)).slice(-15);notify(`🧯 <b>Errors</b>\n<pre>${esc(e.join('\n'))||'none 🎉'}</pre>`)});
 tg.on('settings',()=>notify(`⚙️ <b>Settings</b>\n<pre>Schedule  ${scheduleActive?config.scheduleRaw:'off'}\nFlip      ${config.flipEnabled?'ON':'OFF'}\nReserve   ${fmt(config.balanceReserve)}\nPowerup   ${config.powerupEnabled?'ON':'OFF'}\nBuy today ${fmt(buySpentToday)}/${fmt(config.dailyBuyCap)}</pre>`));
+tg.on('version',()=>notify([
+  `🧩 <b>Version</b>`,
+  `<pre>Bot        ${BOT_VERSION}\nChannel    ${RELEASE_CHANNEL}\nBranch     main\nMode       ${runtimeModeLabel()}\nLast drop  ${lastDisconnectAt ? new Date(lastDisconnectAt).toISOString().replace('T',' ').slice(0,19) + ' UTC' : 'never'}\nReason     ${lastDisconnectReason}</pre>`,
+  'Notes:',
+  '• v25.0.3 pinned install + release sync',
+  '• v30.0.0 foundation starts with clearer runtime telemetry',
+  '• Safe-mode focus: visibility, control, and maintenance ergonomics',
+].join('\n')));
 tg.on('log',(a)=>{const n=Math.min(50,Math.max(1,parseInt(a[0]||'15',10)||15));notify('<pre>'+esc(LOG_RING.slice(-n).join('\n')||'empty')+'</pre>')});
 tg.on('logs',(a)=>tg.handlers['log'](a));
-tg.on('pause',()=>{paused=true;notify('⏸️ Paused')});
-tg.on('resume',()=>{if(!paused){notify('▶️ Running.');return}paused=false;notify('▶️ Resumed');if(activeSocket&&activeSocket.connected)runNextCycle(activeSocket)});
+tg.on('pause',()=>{paused=true;pauseReason='manual pause';notify('⏸️ Paused')});
+tg.on('resume',()=>{if(!paused){notify('▶️ Running.');return}paused=false;pauseReason='';notify('▶️ Resumed');if(activeSocket&&activeSocket.connected)runNextCycle(activeSocket)});
 tg.on('reauth',()=>{notify('🔑 Re-auth…');token=null;try{if(activeSocket)activeSocket.disconnect()}catch{}setTimeout(startBot,1500)});
 tg.on('ping',()=>notify(`🏓 pong · ${connected?'🟢':'🔴'} · ${fmtUptime(Date.now()-stats.startTime)} · ${serverPlayerCount} online`));
 tg.on('schedule',()=>{const l=schedulePhases.map((p,i)=>`${i===schedIdx?'▶️':'  '} ${p.state.toUpperCase()} ${p.hours}h`).join('\n');notify(`🗓️ <b>Schedule</b>\n${scheduleActive?schedStatus():'off'}\n<pre>${l||'none'}</pre>`)});
@@ -731,7 +765,7 @@ if(scheduleActive){schedulePhases=parseSchedule(config.scheduleRaw);if(scheduleP
 setInterval(()=>{if(!scheduleActive||!schedulePhases.length)return;if(Date.now()>=schedPhaseEnd){schedIdx=(schedIdx+1)%schedulePhases.length;applyPhase(true)}},30000);
 
 // ============ BOOT ============
-log('🚀 v25 Smart Orchestrator starting…');
+log(`🚀 v${BOT_VERSION} Smart Orchestrator starting…`);
 tg.startPolling();
-notifySys('🚀 <b>Owntown v25</b> — Smart Orchestrator\n<i>/help commands · /status dashboard</i>');
+notifySys(`🚀 <b>Owntown v${BOT_VERSION}</b> — Smart Orchestrator\n<i>/help commands · /status dashboard</i>`);
 startBot();

@@ -10,7 +10,7 @@ const MAIN_FILES = ['bot.js', 'telegram.js', 'config.js'];
 const EXPECTED_COMMANDS = [
   'help', 'start', 'stop', 'status', 'stats', 'balance', 'daily', 'income',
   'wallet', 'quest', 'candy', 'boss', 'world', 'pvpboard', 'market', 'trades',
-  'listings', 'inventory', 'health', 'errors', 'settings', 'log', 'logs',
+  'listings', 'inventory', 'health', 'errors', 'settings', 'version', 'log', 'logs',
   'pause', 'resume', 'reauth', 'ping', 'schedule', 'restart', 'update',
 ];
 
@@ -23,7 +23,7 @@ test('main source files pass node syntax check', () => {
 test('package metadata matches project identity', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   assert.equal(pkg.name, 'owntown-farmer');
-  assert.equal(pkg.version, '25.0.3');
+  assert.equal(pkg.version, '30.0.0');
 });
 
 test('telegram command handlers match documented command surface', () => {

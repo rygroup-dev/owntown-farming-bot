@@ -35,7 +35,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-
 ### Pinned release install
 
 ```bash
-OWNTOWN_REF=v25.0.3 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+OWNTOWN_REF=v30.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
 ### Manual install
@@ -81,6 +81,7 @@ npm start
 - `/listings`
 - `/inventory`
 - `/health`
+- `/version`
 - `/errors`
 - `/settings`
 - `/log`
@@ -100,6 +101,16 @@ npm test
 ```
 
 The test suite covers syntax checks, Telegram command registration, market decision logic, and schedule parsing.
+
+## Release Notes
+
+- `v25.0.3`
+  - Sync pinned installer/tag/docs with the latest upstream fixes.
+  - Keep GitHub `main`, raw installer, and tagged install path aligned.
+- `v30.0.0`
+  - Add clearer runtime telemetry for reconnects, pause reasons, and current mode.
+  - Add `/version` command so operators can verify build, channel, and last drop reason quickly.
+  - Keep the bot easier to audit and operate during live maintenance windows.
 
 ## Notes
 
