@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const { toPlainTelegramText } = require('../telegram');
 
 const ROOT = path.join(__dirname, '..');
 const MAIN_FILES = ['bot.js', 'telegram.js', 'config.js'];
@@ -30,4 +31,12 @@ test('telegram command handlers match documented command surface', () => {
   const commands = [...botJs.matchAll(/tg\.on\('([^']+)'/g)].map((match) => match[1]);
 
   assert.deepEqual(commands, EXPECTED_COMMANDS);
+});
+
+test('telegram html fallback strips unsafe tags from runtime errors', () => {
+  const raw = '⚠️ Error menjalankan /server: Unexpected token \'<\', "<!doctype html>" is not valid JSON';
+  assert.equal(
+    toPlainTelegramText(raw),
+    '⚠️ Error menjalankan /server: Unexpected token \'" is not valid JSON'
+  );
 });

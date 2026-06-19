@@ -2,6 +2,17 @@
 // Push notifications + remote command polling via the Telegram Bot API.
 const https = require('https');
 
+function toPlainTelegramText(text) {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .trim();
+}
+
 function tgApi(token, method, body) {
   return new Promise((resolve) => {
     const data = body ? JSON.stringify(body) : null;
@@ -44,14 +55,23 @@ class Telegram {
 
   async sendKeyboard(text, buttons) {
     if (!this.enabled || !this.chatId) return;
-    const res = await tgApi(this.token, 'sendMessage', {
+    const body = {
       chat_id: this.chatId,
       text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       reply_markup: { inline_keyboard: buttons },
-    });
-    if (!res.ok) this.log(`📱 sendKeyboard failed: ${res.description || res.error || 'unknown'}`);
+    };
+    const res = await tgApi(this.token, 'sendMessage', body);
+    if (!res.ok) {
+      // Server/game error kadang bawa HTML mentah (mis. <!doctype ...>).
+      // Fallback ke plain text biar command tidak diam.
+      const fallback = { ...body, text: toPlainTelegramText(text) };
+      delete fallback.parse_mode;
+      const retry = await tgApi(this.token, 'sendMessage', fallback);
+      if (!retry.ok) this.log(`📱 sendKeyboard failed: ${retry.description || retry.error || 'unknown'}`);
+      return retry;
+    }
     return res;
   }
 
@@ -59,7 +79,12 @@ class Telegram {
     if (!this.enabled) return;
     const body = { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', disable_web_page_preview: true };
     if (buttons) body.reply_markup = { inline_keyboard: buttons };
-    return tgApi(this.token, 'editMessageText', body);
+    const res = await tgApi(this.token, 'editMessageText', body);
+    if (res.ok) return res;
+
+    const fallback = { ...body, text: toPlainTelegramText(text) };
+    delete fallback.parse_mode;
+    return tgApi(this.token, 'editMessageText', fallback);
   }
 
   async answerCallback(callbackId, text) {
@@ -78,12 +103,18 @@ class Telegram {
     this.sending = true;
     while (this.queue.length) {
       const text = this.queue.shift();
-      const res = await tgApi(this.token, 'sendMessage', {
+      const body = {
         chat_id: this.chatId,
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
-      });
+      };
+      let res = await tgApi(this.token, 'sendMessage', body);
+      if (!res.ok) {
+        const fallback = { ...body, text: toPlainTelegramText(text) };
+        delete fallback.parse_mode;
+        res = await tgApi(this.token, 'sendMessage', fallback);
+      }
       if (!res.ok) this.log(`📱 Telegram send failed: ${res.description || res.error || 'unknown'}`);
       await new Promise(r => setTimeout(r, 400)); // gentle rate-limit
     }
@@ -154,4 +185,4 @@ class Telegram {
   }
 }
 
-module.exports = { Telegram };
+module.exports = { Telegram, toPlainTelegramText };
