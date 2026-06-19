@@ -3,7 +3,7 @@
 #  RY GROUP — Owntown Farming Bot — One-line Installer
 #  Usage (one-liner):
 #    bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
-#    OWNTOWN_REF=v25.0.1 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+#    OWNTOWN_REF=v25.0.2 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 #  Non-interactive (pass secrets up front):
 #    WALLET_PRIVATE_KEY=xxx TELEGRAM_BOT_TOKEN=yyy bash <(curl -fsSL .../install.sh)
 # ============================================================

@@ -61,7 +61,7 @@ function scheduleStart(ms) {
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
-log('=== OWNTOWN SMART FARMER v25.0.1 ===');
+log('=== OWNTOWN SMART FARMER v25.0.2 ===');
 log('AUTO ORCHESTRATOR: Mining+Fishing+Combat+PvP+Quest+Candy+Market+Bank+Crafting');
 
 // ============ CONSTANTS ============
@@ -454,23 +454,23 @@ tg.on('help',()=>notify([
   '🏭 <b>OWNTOWN v25 — Smart Orchestrator</b>',
   '',
   '📊 <b>Dashboard</b>',
-  '/status — dashboard lengkap',
-  '/balance — saldo OTWN+Candy+Chip',
-  '/daily — laporan harian',
-  '/income — pendapatan + grafik',
+  '/status — full dashboard',
+  '/balance — OTWN + Candy + Chip balances',
+  '/daily — daily report',
+  '/income — earnings + chart',
   '',
   '💰 <b>Wallet & Bank</b>',
   '/wallet — info wallet + on-chain',
-  '/wallet deposit [jumlah] — setor ke bank',
-  '/wallet withdraw [jumlah] — tarik dari bank',
+  '/wallet deposit [amount] — deposit to bank',
+  '/wallet withdraw [amount] — withdraw from bank',
   '',
   '🎮 <b>Game</b>',
-  '/inventory — isi tas + nilai',
-  '/market — harga pasar + tren',
-  '/trades — riwayat jual',
-  '/listings — listing aktif',
-  '/quest — status quest',
-  '/candy — candy + ekonomi',
+  '/inventory — bag contents + value',
+  '/market — market prices + trend',
+  '/trades — sales history',
+  '/listings — active listings',
+  '/quest — quest status',
+  '/candy — candy + economy',
   '/boss — world boss',
   '/world — live state + mobs',
   '/pvpboard — PvP leaderboard',
@@ -483,10 +483,10 @@ tg.on('help',()=>notify([
   '/health · /errors · /settings',
   '/schedule · /log [n] · /ping',
   '',
-  '<i>⚠️ 1 wallet = 1 sesi. /stop untuk main manual.</i>',
+  '<i>⚠️ 1 wallet = 1 session. Use /stop for manual play.</i>',
 ].join('\n')));
 tg.on('start',()=>{paused=false;stopped=false;if(connected){notify('▶️ Already farming.');return}notify('🚀 Connecting…');startBot()});
-tg.on('stop',()=>{stopped=true;paused=false;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false;notify('⏹️ <b>Stopped</b> — main manual.')});
+tg.on('stop',()=>{stopped=true;paused=false;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false;notify('⏹️ <b>Stopped</b> — manual mode.')});
 tg.on('status',()=>{const p=getProfitSummary(),up=fmtUptime(Date.now()-stats.startTime),alive=liveMonsters.filter(m=>m.alive).length;notify([`${connected?'🟢':'🔴'} <b>OWNTOWN v25</b> · ${paused?'⏸️':stopped?'⏹️':connected?'▶️ '+currentActivity:'⏳'}`,`<i>⏱${up} · 📍${zoneName} · Lv${level} (${stats.xp}/${stats.xpForNext||'?'}XP)</i>`,'','💰 <b>Economy</b>',`<pre>Balance  ${fmt(Math.round(balance))} OTWN\nCandy    ${fmt(candyBalance)}\nChip     ${fmt(chipBalance)}\nBank     ${fmt(stats.bankBalance)}\nEarned   ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h</pre>`,'',`🧍 ❤️${hp}/${maxHp} ⚡${stamina} 📦${inventory.length}/${CARRY_CAP}`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)} 🔨${fmt(stats.crafted)} 👹${fmt(stats.bossClaims)}`,`🌍 ${serverPlayerCount} online · ${alive}/${liveMonsters.length} mobs · boss:${worldBossState?.phase||'?'}`,`📜 Quest: ${questState?.activeId||'none'} (${(questState?.completed||[]).length} done)`,`${stats.errors?'⚠️':'✅'} err:${stats.errors} reconn:${stats.reconnects||0}`].join('\n'))});
 tg.on('stats',()=>tg.handlers['status']());
 tg.on('balance',()=>notify(`💰 <b>Balance</b>\n<pre>OTWN     ${fmt(Math.round(balance))}\nLocked   ${fmt(lockedBalance)}\nCandy    ${fmt(candyBalance)} 🍬\nChip     ${fmt(chipBalance)} 🎰\nBank     ${fmt(stats.bankBalance)}\nDaily    ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}</pre>`));
@@ -507,7 +507,7 @@ tg.on('wallet',async(args)=>{
     return;
   }
   if(sub==='withdraw'&&amount>0){
-    if(!bankInfo||bankInfo.withdrawable<amount){notify(`⚠️ Withdrawable: ${fmt(bankInfo?.withdrawable||0)} OTWN (butuh ${amount})\nMin withdraw server: ${fmt(wdMin)}`);return}
+    if(!bankInfo||bankInfo.withdrawable<amount){notify(`⚠️ Withdrawable: ${fmt(bankInfo?.withdrawable||0)} OTWN (need ${amount})\nServer minimum withdraw: ${fmt(wdMin)}`);return}
     if(activeSocket)activeSocket.emit('bank:withdraw',{amount});
     const fee=Math.round(amount*wdFee);
     notify(`🏦 <b>Withdrawing</b> ${fmt(amount)} OTWN (fee ~${fee})…\n<i>Min server: ${fmt(wdMin)} — server will confirm or reject</i>`);

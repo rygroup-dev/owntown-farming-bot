@@ -1,45 +1,30 @@
 # Owntown Farming Bot
 
-Bot farming otomatis untuk `owntown.fun` dengan kontrol Telegram.
+Automated `owntown.fun` farming bot with Telegram control and monitoring.
 
-Repo ini saat ini masih berbentuk **monolith**:
-- `bot.js` = logika utama bot
-- `telegram.js` = integrasi Telegram Bot API
-- `config.js` = loader `.env`
+## Features
 
-README ini sudah dirapikan supaya **sesuai implementasi real** di repo, bukan gabungan roadmap/claim lama.
+- Solana wallet authentication via challenge-response
+- `socket.io-client` game connection
+- Mining, fishing, combat, and PvP activity loops
+- Marketplace scanning with `MARKETPLACE` / `QUICKSELL` / `HOLD` decisions
+- Telegram control, reporting, and remote maintenance commands
+- Time-based online/offline scheduling
+- Bank, candy, boss, world, market, trades, listings, inventory, and health commands
 
-## Status Repo
-
-Yang benar-benar ada di repo:
-- autentikasi wallet Solana via challenge-response
-- koneksi game via `socket.io-client`
-- loop aktivitas mining, fishing, combat, PvP
-- marketplace scanning + smart sell decision
-- quick sell untuk item tertentu
-- kontrol dan monitoring lewat Telegram
-- schedule on/off berbasis jam
-- bank, candy, boss, world, market, trades, listings, inventory, health
-
-Yang **tidak** ada sebagai modul terpisah:
-- `errorbus.js`
-- `selfheal.js`
-- `autopatch.js`
-
-Jadi kalau ada klaim self-fix/autopatch modular, itu **bukan kondisi repo saat ini**.
-
-## Struktur
+## Project Layout
 
 ```text
 bot.js
 telegram.js
 config.js
+lib/
+test/
 install.sh
 owntown-bot.service
-README.md
 ```
 
-## Install
+## Installation
 
 ### One-line install
 
@@ -47,13 +32,13 @@ README.md
 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
-Pinned stable release:
+### Pinned release install
 
 ```bash
-OWNTOWN_REF=v25.0.1 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+OWNTOWN_REF=v25.0.2 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
-### Manual
+### Manual install
 
 ```bash
 git clone https://github.com/rygroup-dev/owntown-farming-bot.git
@@ -62,22 +47,20 @@ npm install
 cp .env.example .env
 ```
 
-Isi minimal `.env`:
+Minimum `.env` values:
 
 ```env
 WALLET_PRIVATE_KEY=your_base58_private_key
 TELEGRAM_BOT_TOKEN=123456:AA...
 ```
 
-Lalu jalankan:
+Run the bot:
 
 ```bash
 npm start
 ```
 
 ## Telegram Commands
-
-Command yang benar-benar terdaftar di `bot.js` saat ini:
 
 - `/help`
 - `/start`
@@ -110,63 +93,16 @@ Command yang benar-benar terdaftar di `bot.js` saat ini:
 - `/restart`
 - `/update`
 
-Total command handler aktif: **30**
-
-## Fitur yang Terkonfirmasi
-
-### Core gameplay
-- mining
-- fishing
-- combat
-- PvP queue/attack/result handling
-
-### Economy
-- scan harga marketplace
-- decision `MARKETPLACE` / `QUICKSELL` / `HOLD`
-- quick sell aman untuk item tertentu
-- flip opportunity check
-- powerup buy check
-- profit tracking per jam
-
-### Utility
-- token refresh / reauth
-- reconnect scheduling
-- schedule on/off
-- Telegram monitoring dan remote control
-
 ## Testing
-
-Repo ini sekarang punya smoke test dasar untuk:
-- syntax check file utama
-- validasi command Telegram utama terdaftar
-- validasi decision logic market + parser schedule
-
-Jalankan:
 
 ```bash
 npm test
 ```
 
-## Catatan Arsitektur
+The test suite covers syntax checks, Telegram command registration, market decision logic, and schedule parsing.
 
-Hal yang masih perlu diketahui:
-- `bot.js` masih sangat besar dan menampung terlalu banyak tanggung jawab
-- dokumentasi sebelumnya overclaim dibanding kode real
-- refactor ideal berikutnya adalah memecah:
-  - auth/api
-  - market logic
-  - activity loop
-  - telegram commands
-  - scheduling/state
+## Notes
 
-## Rekomendasi Lanjutan
-
-Kalau repo ini mau dibikin lebih sehat, urutan yang masuk akal:
-
-1. pisahkan `bot.js` jadi modul-modul kecil
-2. tambahkan unit test untuk market decision, schedule, dan Telegram command layer
-3. bikin README tetap sinkron dengan implementasi real
-
-## Disclaimer
-
-Gunakan dengan risiko sendiri. Server game bisa berubah kapan saja dan membuat flow bot perlu disesuaikan lagi.
+- This repository ships the currently implemented bot only.
+- Keep `.env`, wallet credentials, and Telegram tokens private.
+- Game-side API or protocol changes may require bot updates.

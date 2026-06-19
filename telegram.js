@@ -64,8 +64,8 @@ class Telegram {
     };
     const res = await tgApi(this.token, 'sendMessage', body);
     if (!res.ok) {
-      // Server/game error kadang bawa HTML mentah (mis. <!doctype ...>).
-      // Fallback ke plain text biar command tidak diam.
+      // Some upstream failures include raw HTML (for example <!doctype ...>).
+      // Retry in plain text so the command never fails silently.
       const fallback = { ...body, text: toPlainTelegramText(text) };
       delete fallback.parse_mode;
       const retry = await tgApi(this.token, 'sendMessage', fallback);
