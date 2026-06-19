@@ -5,32 +5,22 @@ const nacl = require('tweetnacl');
 const bs58 = require('bs58').default || require('bs58');
 const { config, persistEnv } = require('./config');
 const { Telegram } = require('./telegram');
-const { ErrorBus } = require('./errorbus');
-const selfheal = require('./selfheal');
 const path = require('path');
-const errorBus = new ErrorBus(path.join(__dirname, 'errors.json'));
-const autopatch = require('./autopatch');
-const patchLimiter = new autopatch.RateLimiter(10 * 60000, 60 * 60000, 1, 3); // max 1/10min, 3/hour
-const BACKUP_DIR = path.join(__dirname, '.autopatch-backups');
-const PENDING_PATCH = path.join(__dirname, '.autopatch-pending.json');
-try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); } catch {}
 
-// ============ CONFIG (env-driven, see .env) ============
+// ============ CONFIG ============
 const TOKEN_PATH = config.tokenPath;
 const GAME_HOST = config.gameHost;
 let WALLET_ADDR = config.walletAddress;
 const WALLET_FILE = config.walletFile;
 const LOG = config.logPath;
-let MY_PLAYER_ID = config.playerId; // auto-detected at runtime if blank
-try { fs.writeFileSync(LOG, ''); } catch (e) { /* log dir may be missing; fall back to stdout */ }
+let MY_PLAYER_ID = config.playerId;
+try { fs.writeFileSync(LOG, ''); } catch {}
 
-// circular ring buffer of recent log lines (for /log command)
 const LOG_RING = [];
 const LOG_RING_MAX = 200;
-
 function log(m) {
   const l = new Date().toISOString().slice(11,19) + ' | ' + m;
-  try { fs.appendFileSync(LOG, l + '\n'); } catch (e) { /* ignore fs errors */ }
+  try { fs.appendFileSync(LOG, l + '\n'); } catch {}
   process.stdout.write(l + '\n');
   LOG_RING.push(l);
   if (LOG_RING.length > LOG_RING_MAX) LOG_RING.shift();
@@ -43,138 +33,44 @@ const tg = new Telegram({
   logger: log,
   onChatIdLearned: (id) => persistEnv('TELEGRAM_CHAT_ID', id),
 });
-function notify(m) { tg.send(m); }                                   // always (profit reports, command replies, critical)
-function notifySys(m) { if (!config.notifyProfitOnly) tg.send(m); }  // routine/system events — muted when profit-only
+function notify(m) { tg.send(m); }
+function notifySys(m) { if (!config.notifyProfitOnly) tg.send(m); }
 
-// ── Central error capture (L1) + runtime self-heal (L2) + autopatch trigger (L3) ──
-// category 'reconnect' = connection noise (ping/transport/auth timeout), counted
-// separately from farming errors so /status is honest.
-function reportError({ code, context, expected, zone, category }) {
+// ============ ERROR TRACKING ============
+function reportError({ code, context, category }) {
   if (category === 'reconnect') { stats.reconnects++; }
   else { stats.errors++; stats.consecutiveErrors++; }
-  const entry = errorBus.record({ code, context, expected, zone });
-  const alreadyPatched = entry.status === 'patched'; // never downgrade or re-patch a patched sig
-
-  const action = selfheal.decide({ code: entry.code, zone, count: entry.count });
-  if (action) {
-    applySelfHeal(action);
-    if (!alreadyPatched) errorBus.setStatus(entry.sig, 'self-healed', action.type);
-  }
-
-  const recipe = autopatch.selectRecipe({ code: entry.code, zone, count: entry.count });
-  if (recipe && !alreadyPatched && patchLimiter.tryAcquire(Date.now())) {
-    runAutoPatch(recipe, entry);
-  }
-  return entry;
-}
-
-function applySelfHeal(action) {
-  if (action.type === 'blacklist-zone' && !ZONE_BLACKLIST.includes(action.zone)) {
-    ZONE_BLACKLIST.push(action.zone);
-    log(`🩹 self-heal: avoid zone ${action.zone}`);
-  } else if (action.type === 'tune-reconnect-runtime') {
-    RECONNECT_BACKOFF_MS = Math.min(120000, Math.round(RECONNECT_BACKOFF_MS * 1.5));
-    log(`🩹 self-heal: reconnect backoff → ${RECONNECT_BACKOFF_MS}ms`);
-  }
-}
-
-// ── AutoPatch runtime (Layer 3): apply recipe to bot.js source, restart, verify ──
-function runAutoPatch(recipe, entry) {
-  const res = autopatch.applyRecipe(recipe, { sourcePath: path.join(__dirname, 'bot.js'), backupDir: BACKUP_DIR, entry });
-  if (!res.ok) {
-    log(`🔧 autopatch ${recipe.name} FAILED parse-check — not applied (${res.error})`);
-    notify(`🔧 <b>AutoPatch aborted</b>\nRecipe: ${recipe.name}\nError: ${res.error}`);
-    return;
-  }
-  if (res.noop) {
-    log(`🔧 autopatch ${recipe.name}: no-op (region already up to date) — no restart`);
-    errorBus.setStatus(entry.sig, 'patched', recipe.name); // mark handled so we don't retry
-    return;
-  }
-  // Record a pending patch so the next boot verifies connect within 60s, else rolls back.
-  // (PENDING_PATCH is last-write-wins; the rate limiter makes concurrent patches effectively impossible.)
-  try { fs.writeFileSync(PENDING_PATCH, JSON.stringify({ recipe: recipe.name, sig: entry.sig, backup: res.backup, at: Date.now() })); } catch {}
-  errorBus.setStatus(entry.sig, 'patched', recipe.name);
-  log(`🔧 autopatch ${recipe.name} applied → restarting to verify`);
-  notify(`🔧 <b>AutoPatch applied</b>\nRecipe: ${recipe.name}\nError: ${entry.code} (×${entry.count})\nRestarting to verify…`);
-  setTimeout(() => process.exit(0), 1500); // systemd Restart=always brings it back patched
-}
-
-// Restore bot.js from a pending patch's backup, ALWAYS clear the pending marker, then restart.
-// `finally` guarantees we never get stuck if the backup is missing (cleared pending + exit anyway).
-function rollbackPatch(pend, why) {
-  try {
-    fs.copyFileSync(pend.backup, path.join(__dirname, 'bot.js'));
-    log(`↩️ autopatch ${pend.recipe} ROLLED BACK (${why})`);
-    notify(`↩️ <b>AutoPatch rolled back</b>: ${pend.recipe} — ${why}. Restarting clean.`);
-  } catch (e) {
-    log(`rollback failed (backup missing?): ${e.message} — clearing pending to avoid stuck state`);
-    notify(`⚠️ <b>AutoPatch rollback FAILED</b>: ${pend.recipe} (${e.message}). Cleared pending; patched code stays live.`);
-  } finally {
-    try { fs.unlinkSync(PENDING_PATCH); } catch {}
-    setTimeout(() => process.exit(0), 1500);
-  }
-}
-
-// Boot-time verification of any pending patch: connected within 60s → keep; else rollback + restart.
-// NOTE: while the pending marker exists (up to 60s post-patch), an UNRELATED crash also triggers
-// rollback (see uncaughtException). That fail-safe bias is intentional: reverting a small benign
-// patch is far cheaper than an unattended crash-loop.
-function verifyPendingPatchOnBoot() {
-  let pend;
-  try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')); } catch { return; }
-  const deadline = Date.now() + 60000;
-  const iv = setInterval(() => {
-    if (connected) {
-      clearInterval(iv);
-      try { fs.unlinkSync(PENDING_PATCH); } catch {}
-      log(`✅ autopatch ${pend.recipe} verified (connected)`);
-      notify(`✅ <b>AutoPatch verified</b>: ${pend.recipe} — connection OK`);
-    } else if (Date.now() > deadline) {
-      clearInterval(iv);
-      rollbackPatch(pend, 'no connect in 60s');
-    }
-  }, 3000);
+  log(`⚠️ Error: ${code} — ${context || ''}`);
 }
 
 // ============ AUTOPILOT STATE ============
 let paused = false;
-let stopped = false;          // true = game session fully off (user plays manually); no auto-reconnect
-let currentActivity = 'idle'; // live: what the bot is doing right now
-let lastActivity = Date.now();        // updated on any meaningful game result
-let activeSocket = null;              // current live socket (for watchdog/commands)
+let stopped = false;
+let currentActivity = 'idle';
+let lastActivity = Date.now();
+let activeSocket = null;
 let lastCycleStart = Date.now();
-let retryTimer = null;                // single pending (re)connect timer
+let retryTimer = null;
 function touchActivity() { lastActivity = Date.now(); }
 function scheduleStart(ms) {
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
-log('=== OWNTOWN PROFIT FARMER v24.0 ===');
-log('FULL FEATURED: PvP + Property + Shop + Crafting + Bank + Vehicle + Smart Sell + Telegram Dashboard');
+log('=== OWNTOWN SMART FARMER v25.0 ===');
+log('AUTO ORCHESTRATOR: Mining+Fishing+Combat+PvP+Quest+Candy+Market+Bank+Crafting');
 
 // ============ CONSTANTS ============
 const WALK_SPEED = 0.4;
 const MAX_WALK_STEPS = 5000;
-let DAILY_EARN_CAP = 5000;  // fallback only; real per-account cap comes from server via player:state → dailyEarnCap
-const CARRY_CAP = 56;
+let DAILY_EARN_CAP = 0;
+let CARRY_CAP = 44;
 const MARKET_INTERVAL = 3500;
 const LOW_DURABILITY = 30;
 const FISHING_TIMEOUT = 120000;
-// === AUTOPATCH:TIMEOUTS:START ===
 let REST_TIMEOUT = 20000;
 let AUTH_TIMEOUT = 20000;
-// === AUTOPATCH:TIMEOUTS:END ===
-// === AUTOPATCH:RECONNECT:START ===
 let RECONNECT_BACKOFF_MS = 30000;
-// === AUTOPATCH:RECONNECT:END ===
-// === AUTOPATCH:ZONE_BLACKLIST:START ===
-const ZONE_BLACKLIST = [];
-// === AUTOPATCH:ZONE_BLACKLIST:END ===
-// === AUTOPATCH:ERROR_HANDLERS:START ===
-const KNOWN_ERROR_CODES = ['COOLDOWN', 'NO_TARGET', 'WRONG_ZONE'];
-// === AUTOPATCH:ERROR_HANDLERS:END ===
 const UNDERCUT_PCT = 0.08;
 const LOW_STAMINA = 30;
 const FATIGUE_THRESHOLD = 0.80;
@@ -183,1912 +79,341 @@ const HEAL_HP = 80;
 
 // ============ PRICE FLOORS ============
 const PRICE_FLOOR = {
-  fish_sun_carp: 2000, fish_moon_koi: 500, fish_void_angler: 300,
-  fish_abyssal_lantern: 300, fish_golden_koi: 300, fish_silver_darter: 30,
-  mat_resonance_core: 5000, mat_raw_resonite: 10, mat_circuit_scrap: 10,
-  mat_iron_shard: 5, mat_carbon_fiber: 5, wpn_arc_baton: 500, wpn_rail_lance: 2000,
+  fish_sun_carp: 1.5, fish_moon_koi: 0.2, fish_void_angler: 0.3,
+  fish_abyssal_lantern: 0.3, fish_golden_koi: 0.3, fish_silver_darter: 0.1,
+  mat_resonance_core: 3, mat_raw_resonite: 0.1, mat_circuit_scrap: 0.1,
+  mat_iron_shard: 0.05, mat_carbon_fiber: 0.5,
+  gear_resonite_edge: 0.2, gear_fault_greaves: 0.2, gear_volt_anklets: 0.1,
 };
-
 const QUICKSELL = {
   mat_raw_resonite: 6, mat_circuit_scrap: 3, mat_iron_shard: 2,
   mat_carbon_fiber: 2, mat_resonance_core: 50,
   fish_silver_darter: 4, fish_sun_carp: 3, fish_moon_koi: 10,
   fish_void_angler: 15, fish_abyssal_lantern: 20, fish_golden_koi: 15,
-  wpn_arc_baton: 100, wpn_rail_lance: 200,
 };
 
 // ============ ITEM CATEGORIES ============
-const KEEP = new Set([
-  'tool_pulse_pick','cos_coastal_tee','cos_palm_sneakers',
-  'kit_repair','med_patch','food_ember_skewer','food_volt_noodles',
-  'pet_demon_salamander','pet_golden_whale','pet_sea_dragon',
-  'permit_redline','cos_miner_vest','cos_redline_vest'
-]);
+const KEEP = new Set(['tool_pulse_pick','cos_coastal_tee','cos_palm_sneakers','kit_repair','med_patch','food_ember_skewer','food_volt_noodles','pet_demon_salamander','pet_golden_whale','pet_sea_dragon','permit_redline','gear_driftwood_baton']);
+const MARKETPLACE_ONLY = new Set(['fish_sun_carp','fish_moon_koi','fish_void_angler','fish_abyssal_lantern','fish_golden_koi','fish_silver_darter','mat_resonance_core','gear_resonite_edge','gear_fault_greaves','gear_volt_anklets']);
+const SAFE_QUICKSELL = new Set(['mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber']);
+const FOOD_ITEMS = new Set(['food_ember_skewer','food_volt_noodles','med_patch','fish_silver_darter','fish_sun_carp','fish_moon_koi']);
 
-const MARKETPLACE_ONLY = new Set([
-  'fish_sun_carp','fish_moon_koi','fish_void_angler',
-  'fish_abyssal_lantern','fish_golden_koi','fish_silver_darter',
-  'mat_resonance_core','wpn_arc_baton','wpn_rail_lance'
-]);
-
-const SAFE_QUICKSELL = new Set([
-  'mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber'
-]);
-
-const FOOD_ITEMS = new Set([
-  'food_ember_skewer','food_volt_noodles','med_patch',
-  'fish_silver_darter','fish_sun_carp','fish_moon_koi'
-]);
-
-// ============ GEAR RECIPES ============
 const GEAR_RECIPES = {
-  'craft_rail_lance': { needs: { mat_raw_resonite: 4, mat_circuit_scrap: 2, mat_resonance_core: 1 }, fee: 25 },
   'craft_repair_kit': { needs: { mat_iron_shard: 2, mat_carbon_fiber: 1 }, fee: 5 },
   'craft_tide_helm': { needs: { mat_iron_shard: 5, mat_circuit_scrap: 3 }, fee: 50 },
   'craft_reef_plate': { needs: { mat_iron_shard: 8, mat_carbon_fiber: 4 }, fee: 80 },
   'craft_dune_boots': { needs: { mat_iron_shard: 3, mat_carbon_fiber: 2 }, fee: 30 },
 };
 
-// ============ MONSTER SPAWNS ============
-const MONSTERS = [
-  { id: 'mon_1', defId: 'faultborn_stray', pos: {x:-100,z:-120} },
-  { id: 'mon_2', defId: 'faultborn_stray', pos: {x:-115,z:-135} },
-  { id: 'mon_3', defId: 'faultborn_stray', pos: {x:-90,z:-150} },
-  { id: 'mon_4', defId: 'faultborn_stray', pos: {x:-130,z:-115} },
-  { id: 'mon_5', defId: 'rift_brute', pos: {x:-150,z:-145} },
-  { id: 'mon_6', defId: 'rift_brute', pos: {x:-125,z:-165} },
-];
+// ============ DYNAMIC WORLD STATE ============
+let liveMonsters = [];
+let livePlayers = [];
+let serverPlayerCount = 0;
 
-// ============ MINING NODES ============
 const MINING_NODES = [
-  { id: 'node_dw_1', pos: {x:75,z:-95} },
-  { id: 'node_dw_2', pos: {x:95,z:-110} },
-  { id: 'node_dw_3', pos: {x:120,z:-90} },
-  { id: 'node_dw_4', pos: {x:140,z:-120} },
-  { id: 'node_dw_5', pos: {x:110,z:-145} },
-  { id: 'node_dw_6', pos: {x:80,z:-155} },
-  { id: 'node_dw_7', pos: {x:150,z:-150} },
-  { id: 'node_dw_8', pos: {x:135,z:-165} },
+  { id: 'node_dw_1', pos: {x:75,z:-95} },  { id: 'node_dw_2', pos: {x:95,z:-110} },
+  { id: 'node_dw_3', pos: {x:120,z:-90} }, { id: 'node_dw_4', pos: {x:140,z:-120} },
+  { id: 'node_dw_5', pos: {x:110,z:-145} },{ id: 'node_dw_6', pos: {x:80,z:-155} },
+  { id: 'node_dw_7', pos: {x:150,z:-150} },{ id: 'node_dw_8', pos: {x:135,z:-165} },
 ];
 
-// ============ ZONE TARGETS ============
 const ZONE_TARGETS = {
-  deepworks: {x:75, z:-95},
-  pond: {x:-148.5, z:0},
-  redline_a: {x:-100, z:-120},
-  residential: {x:-75, z:0},
-  spawn_plaza: {x:0, z:0},
-  clinic: {x:-60, z:-30},
-  food_row: {x:20, z:55},
-  market: {x:25, z:-15},
-  garage: {x:45, z:-30},
-  arena: {x:194, z:-185},
-  property: {x:30, z:40},
+  deepworks:{x:75,z:-95}, pond:{x:-148.5,z:0}, redline_a:{x:-100,z:-120},
+  residential:{x:-75,z:0}, spawn_plaza:{x:0,z:0}, clinic:{x:-60,z:-30},
+  food_row:{x:20,z:55}, market:{x:25,z:-15}, garage:{x:45,z:-30},
+  arena:{x:194,z:-185}, civic_green:{x:10,z:20}, skyvault:{x:50,z:60},
 };
-
-const WAYPOINTS_BASE = {
-  fishing:[{x:0,z:0},{x:-80,z:0},{x:-148.5,z:0}],
-};
-
-const EXPECTED_ZONE = {
-  mining: 'deepworks',
-  fishing: 'pond',
-  combat: 'redline_a',
-  pvp: 'arena',
-};
-
-const ACTIONS = {
-  mining:{count:15,interval:3500},
-  fishing:{count:5,interval:25000},
-  combat:{count:5,interval:3000},
-  pvp:{count:3,interval:5000},
-};
+const WAYPOINTS_BASE = { fishing:[{x:0,z:0},{x:-80,z:0},{x:-148.5,z:0}] };
+const EXPECTED_ZONE = { mining:'deepworks', fishing:'pond', combat:'redline_a', pvp:'arena' };
+const ACTIONS = { mining:{count:15,interval:3500}, fishing:{count:5,interval:25000}, combat:{count:5,interval:3000}, pvp:{count:3,interval:5000} };
 
 // ============ STATE ============
 let stats = {
-  mined:0,fished:0,fought:0,kills:0,xp:0,items:0,
+  mined:0,fished:0,fought:0,kills:0,xp:0,xpForNext:0,items:0,
   soldQuick:0,soldMarket:0,earnedQuick:0,earnedMarket:0,
   listed:0,canceled:0,crafted:0,repaired:0,errors:0,reconnects:0,
   consecutiveErrors:0,startTime:Date.now(),cycles:0,
   wrongZone:0,fishingTimeouts:0,fatigueDrops:0,restCount:0,
   currentNodeIdx:0,currentMonsterIdx:0,foodEaten:0,
   bossFights:0,bossClaims:0,worldBossActive:false,
-  pvpQueued:0,pvpFights:0,pvpWins:0,pvpClaims:0,pvpEarnings:0,
-  propertyBought:0,propertySold:0,propertyEarnings:0,
-  bankDeposits:0,bankWithdrawals:0,bankBalance:0,
-  gearCrafted:0,vehiclesBought:0,notifications:0,
+  pvpQueued:0,pvpFights:0,pvpWins:0,pvpEarnings:0,
+  propertyEarnings:0,bankBalance:0,
   itemsBought:0,itemsFlipped:0,flipProfit:0,
-  clinicHeals:0,portalEntries:0,
-  totalRevenue:0,totalItemsSold:0,avgPrices:{},priceSamples:{},
-  holdCount:0,holdValue:0,
+  clinicHeals:0,totalRevenue:0,totalItemsSold:0,
+  avgPrices:{},priceSamples:{},holdCount:0,holdValue:0,
+  questsCompleted:0,candyClaimed:0,notifications:0,
 };
 let balance=0,level=1,stamina=100,hp=100,dailyEarned=0,maxHp=100;
 let lockedBalance=0,withdrawableBalance=0,prevBalance=null;
-const BALANCE_DROP_ALERT=20;   // report any spendable-balance drop >= this to Telegram
 let inventory=[],inventoryReady=false,connected=false;
-let pos={x:0,z:0},zone='unknown',fishingActive=false;
-let myActiveListings=[];
-let marketPrices = {};
-let marketHistory = [];
-let fatigueMultiplier = 1.0;
-let worldBossState = null;
-let bankInfo = null;
-let pvpState = null;
-let economyLedger = [];
-let notifications = [];
+let pos={x:0,z:0},zone='unknown',zoneName='unknown',mapId='main',fishingActive=false;
+let myActiveListings=[],marketPrices={},marketHistory=[],fatigueMultiplier=1.0;
+let worldBossState=null,bankInfo=null,pvpState=null,economyLedger=[];
+let chipBalance=0,candyBalance=0,questState=null,playerStats={},equipmentBonuses={},equipment={};
+let tradeLog=[],pendingSales=[],lastCreditAt=0,hourlyProfit={};
 
 // ============ REST API ============
-function apiRequest(method, path, body, token, timeoutMs = REST_TIMEOUT) {
-  return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : null;
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    if (data) headers['Content-Length'] = Buffer.byteLength(data);
-    const req = https.request({
-      hostname: GAME_HOST, path, method, headers, timeout: timeoutMs
-    }, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(d) }); }
-        catch { resolve({ status: res.statusCode, data: d }); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('request timeout')); });
-    if (data) req.write(data);
-    req.end();
-  });
-}
-
-async function apiGet(path, token, timeoutMs) { return apiRequest('GET', path, null, token, timeoutMs); }
-async function apiPost(path, body, token, timeoutMs) { return apiRequest('POST', path, body, token, timeoutMs); }
+function apiRequest(method,p,body,token,timeoutMs=REST_TIMEOUT){return new Promise((resolve,reject)=>{const data=body?JSON.stringify(body):null;const headers={'Content-Type':'application/json'};if(token)headers['Authorization']='Bearer '+token;if(data)headers['Content-Length']=Buffer.byteLength(data);const req=https.request({hostname:GAME_HOST,path:p,method,headers,timeout:timeoutMs},res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{try{resolve({status:res.statusCode,data:JSON.parse(d)})}catch{resolve({status:res.statusCode,data:d})}});});req.on('error',reject);req.on('timeout',()=>req.destroy(new Error('timeout')));if(data)req.write(data);req.end();})}
+async function apiGet(p,token,t){return apiRequest('GET',p,null,token,t)}
+async function apiPost(p,body,token,t){return apiRequest('POST',p,body,token,t)}
 
 // ============ AUTH ============
-function loadSecretKey() {
-  // Priority: WALLET_PRIVATE_KEY env (base58) -> WALLET_FILE json {private_key}
-  let b58 = config.walletPrivateKey;
-  if (!b58 && WALLET_FILE) {
-    try { b58 = JSON.parse(fs.readFileSync(WALLET_FILE)).private_key; } catch (e) { /* ignore */ }
-  }
-  if (!b58) throw new Error('No wallet configured — set WALLET_PRIVATE_KEY (base58) in .env');
-  const secretKey = bs58.decode(b58);
-  if (secretKey.length === 32) {
-    // 32-byte seed -> expand to full 64-byte nacl keypair
-    return nacl.sign.keyPair.fromSeed(secretKey).secretKey;
-  }
-  if (secretKey.length !== 64) throw new Error(`Bad private key length ${secretKey.length} (expect 32 or 64 bytes base58)`);
-  return secretKey;
-}
+function loadSecretKey(){let b58=config.walletPrivateKey;if(!b58&&WALLET_FILE){try{b58=JSON.parse(fs.readFileSync(WALLET_FILE)).private_key}catch{}}if(!b58)throw new Error('No wallet — set WALLET_PRIVATE_KEY in .env');const sk=bs58.decode(b58);if(sk.length===32)return nacl.sign.keyPair.fromSeed(sk).secretKey;if(sk.length!==64)throw new Error('Bad key length '+sk.length);return sk;}
 
-async function authenticate() {
-  const secretKey = loadSecretKey();
-  // derive address from key if not provided
-  if (!WALLET_ADDR) {
-    WALLET_ADDR = bs58.encode(secretKey.slice(32));
-    log(`🔑 Derived wallet address: ${WALLET_ADDR}`);
-  }
-  const challenge = await apiPost('/api/auth/challenge', { wallet: WALLET_ADDR }, undefined, AUTH_TIMEOUT);
-  // Guard against flaky/502 challenge responses — don't sign garbage
-  if (challenge.status !== 200 || !challenge.data || typeof challenge.data !== 'object') {
-    throw new Error(`Challenge failed (status ${challenge.status}): ${typeof challenge.data === 'string' ? challenge.data.slice(0,80) : JSON.stringify(challenge.data)}`);
-  }
-  const nonce = challenge.data.nonce || challenge.data.challenge;
-  if (!nonce) throw new Error('Challenge returned no nonce: ' + JSON.stringify(challenge.data).slice(0,120));
-  const message = challenge.data.message || ('owntown_auth:' + nonce);
-  const sig = nacl.sign.detached(Buffer.from(message), secretKey);
-  const result = await apiPost('/api/auth/verify', { wallet: WALLET_ADDR, nonce, signature: bs58.encode(sig) }, undefined, AUTH_TIMEOUT);
-  if (!result.data.token) throw new Error('Auth failed: ' + JSON.stringify(result.data));
-  try { fs.writeFileSync(TOKEN_PATH, result.data.token); } catch (e) { /* ignore */ }
-  log('🔑 Authenticated! Token valid until ' + new Date(JSON.parse(Buffer.from(result.data.token.split('.')[1],'base64')).exp*1000).toISOString());
-  return result.data.token;
+async function authenticate(){
+  const secretKey=loadSecretKey();
+  if(!WALLET_ADDR){WALLET_ADDR=bs58.encode(secretKey.slice(32));log(`🔑 Wallet: ${WALLET_ADDR}`);}
+  const ch=await apiPost('/api/auth/challenge',{wallet:WALLET_ADDR},undefined,AUTH_TIMEOUT);
+  if(ch.status!==200||!ch.data||typeof ch.data!=='object')throw new Error(`Challenge failed (${ch.status})`);
+  const nonce=ch.data.nonce||ch.data.challenge;
+  if(!nonce)throw new Error('No nonce');
+  const message=ch.data.message||('owntown_auth:'+nonce);
+  const sig=nacl.sign.detached(Buffer.from(message),secretKey);
+  const r=await apiPost('/api/auth/verify',{wallet:WALLET_ADDR,nonce,signature:bs58.encode(sig)},undefined,AUTH_TIMEOUT);
+  if(!r.data.token)throw new Error('Auth failed: '+JSON.stringify(r.data));
+  try{fs.writeFileSync(TOKEN_PATH,r.data.token)}catch{}
+  log('🔑 Authenticated!');
+  return r.data.token;
 }
-
-function getToken() {
-  try { return fs.readFileSync(TOKEN_PATH, 'utf-8').trim(); } catch { return null; }
-}
-
-function isTokenExpired(tok) {
-  try {
-    const payload = JSON.parse(Buffer.from(tok.split('.')[1], 'base64'));
-    return Date.now() >= (payload.exp * 1000 - 60000);
-  } catch { return true; }
-}
-
-let token = getToken();
+function getToken(){try{return fs.readFileSync(TOKEN_PATH,'utf-8').trim()}catch{return null}}
+function isTokenExpired(tok){try{return Date.now()>=JSON.parse(Buffer.from(tok.split('.')[1],'base64')).exp*1000-60000}catch{return true}}
+let token=getToken();
 
 // ============ MARKET INTELLIGENCE ============
-function scanMarketPrices(listings) {
-  const best = {};
-  const counts = {};
-  for(const l of listings) {
-    if(l.status !== 'active') continue;
-    const ppu = Math.round(l.price / (l.qty || 1));
-    if(!best[l.defId] || ppu < best[l.defId]) best[l.defId] = ppu;
-    counts[l.defId] = (counts[l.defId] || 0) + 1;
-  }
-  marketPrices = best;
-  marketHistory.push({ time: Date.now(), prices: {...best}, counts: {...counts} });
-  if(marketHistory.length > 100) marketHistory.shift();
-  for(const [defId, price] of Object.entries(best)) {
-    if(!stats.avgPrices[defId]) {
-      stats.avgPrices[defId] = price;
-      stats.priceSamples[defId] = 1;
-    } else {
-      stats.priceSamples[defId]++;
-      stats.avgPrices[defId] = Math.round(stats.avgPrices[defId] * 0.9 + price * 0.1);
-    }
-  }
+function scanMarketPrices(listings){const best={},counts={};for(const l of listings){if(l.status!=='active')continue;const ppu=l.price/(l.qty||1);if(!best[l.defId]||ppu<best[l.defId])best[l.defId]=ppu;counts[l.defId]=(counts[l.defId]||0)+1;}marketPrices=best;marketHistory.push({time:Date.now(),prices:{...best},counts:{...counts}});if(marketHistory.length>100)marketHistory.shift();for(const[defId,price]of Object.entries(best)){if(!stats.avgPrices[defId]){stats.avgPrices[defId]=price;stats.priceSamples[defId]=1}else{stats.priceSamples[defId]++;stats.avgPrices[defId]=stats.avgPrices[defId]*0.9+price*0.1;}}}
+function getMarketDepth(defId){const l=marketHistory[marketHistory.length-1];return l?(l.counts[defId]||0):0}
+function getPriceTrend(defId){if(marketHistory.length<3)return'stable';const r=marketHistory.slice(-3).map(h=>h.prices[defId]).filter(Boolean);if(r.length<2)return'stable';const avg=r.reduce((a,b)=>a+b,0)/r.length;const c=(r[r.length-1]-avg)/avg;return c>0.1?'rising':c<-0.1?'falling':'stable'}
+function getSellDecision(defId,qty){const floor=PRICE_FLOOR[defId]||0.01;const qsPrice=QUICKSELL[defId]||1;const mktPrice=marketPrices[defId];const depth=getMarketDepth(defId);const trend=getPriceTrend(defId);if(MARKETPLACE_ONLY.has(defId)){if(!mktPrice||mktPrice<floor)return{action:'HOLD',reason:`mkt<floor`,floor};const undercut=Math.max(floor,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10);return{action:'MARKETPLACE',price:undercut,marketBest:mktPrice,depth,trend}}if(SAFE_QUICKSELL.has(defId))return{action:'QUICKSELL',price:qsPrice};if(mktPrice&&mktPrice>floor)return{action:'MARKETPLACE',price:Math.max(floor,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10),marketBest:mktPrice,depth,trend};return{action:'QUICKSELL',price:qsPrice}}
+
+// ============ PROFIT TRACKING ============
+function bucketEarn(a){if(!a||a<=0)return;const k=Math.floor(Date.now()/3600000);hourlyProfit[k]=(hourlyProfit[k]||0)+a;const keys=Object.keys(hourlyProfit).map(Number).sort((a,b)=>a-b);while(keys.length>48)delete hourlyProfit[keys.shift()]}
+function getHourly(n=12){const cur=Math.floor(Date.now()/3600000),out=[];for(let i=n-1;i>=0;i--){const k=cur-i;out.push({h:String(new Date(k*3600000).getHours()).padStart(2,'0'),v:Math.round(hourlyProfit[k]||0)})}return out}
+function recordSale(defId,qty,method,price){const total=price*qty;stats.totalRevenue+=total;stats.totalItemsSold+=qty;if(method==='quickSell'){stats.soldQuick+=qty;stats.earnedQuick+=total}else{stats.soldMarket+=qty;stats.earnedMarket+=total}bucketEarn(total);tradeLog.push({t:Date.now(),defId,qty,method,price,total});if(tradeLog.length>120)tradeLog.shift();pendingSales.push({t:Date.now(),defId,qty,method,price,total});lastCreditAt=Date.now();log(`💰 ${method==='quickSell'?'QS':'MKT'} ${defId} x${qty} @${price} = ${total}`)}
+function cleanName(id){return String(id).replace(/^(mat_|fish_|wpn_|tool_|cos_|food_|med_|kit_|pet_|permit_|gear_|mount_|veh_)/,'').replace(/_/g,' ')}
+function getProfitSummary(){const h=(Date.now()-stats.startTime)/3600000;const t=stats.earnedQuick+stats.earnedMarket+stats.pvpEarnings+stats.propertyEarnings;return{totalEarned:t,rate:h>0?Math.round(t/h):0,itemsSold:stats.totalItemsSold,hours:h.toFixed(1)}}
+
+// ============ SMART ORCHESTRATOR ============
+function decideNextAction(){
+  if(hp<LOW_HP&&zone!=='clinic')return'heal';
+  if(inventory.length>=CARRY_CAP-4)return'sell';
+  if(stamina<LOW_STAMINA)return'eat';
+  const order=['sell','mining','fishing','combat','mining','fishing','mining','combat'];
+  return order[stats.cycles%order.length];
 }
+function getAliveMonster(){if(liveMonsters.length>0){const alive=liveMonsters.filter(m=>m.alive);if(alive.length>0)return alive[stats.currentMonsterIdx%alive.length]}return{id:'mon_1',pos:{x:-100,z:-120}}}
 
-function getMarketDepth(defId) {
-  const last = marketHistory[marketHistory.length - 1];
-  return last ? (last.counts[defId] || 0) : 0;
-}
+// ============ CRAFTING / FOOD / HEAL ============
+function tryCraft(sock){for(const[id,r]of Object.entries(GEAR_RECIPES)){let ok=true;for(const[m,q]of Object.entries(r.needs))if(!inventory.find(i=>i.defId===m&&i.qty>=q)){ok=false;break}if(ok&&balance>=r.fee){sock.emit('inventory:craft',{recipeId:id});stats.crafted++;log(`🔨 Craft ${id}`);return true}}return false}
+function tryEatFood(sock){const f=inventory.find(i=>i.defId==='med_patch')||inventory.find(i=>i.defId==='food_ember_skewer')||inventory.find(i=>i.defId==='food_volt_noodles')||inventory.find(i=>FOOD_ITEMS.has(i.defId));if(f){sock.emit('inventory:use',{instanceId:f.instanceId});stats.foodEaten++;return true}return false}
+function tryClinicHeal(sock){if(zone==='clinic'&&hp<HEAL_HP&&balance>=10){sock.emit('shop:clinicHeal');stats.clinicHeals++;return true}return false}
 
-function getPriceTrend(defId) {
-  if(marketHistory.length < 3) return 'stable';
-  const recent = marketHistory.slice(-3).map(h => h.prices[defId]).filter(Boolean);
-  if(recent.length < 2) return 'stable';
-  const avg = recent.reduce((a,b) => a+b, 0) / recent.length;
-  const latest = recent[recent.length - 1];
-  const change = (latest - avg) / avg;
-  if(change > 0.1) return 'rising';
-  if(change < -0.1) return 'falling';
-  return 'stable';
-}
+// ============ BANK ============
+async function checkBank(tok){try{const r=await apiGet('/api/bank/status',tok);if(r.status===200&&r.data){bankInfo=r.data;stats.bankBalance=r.data.withdrawable||0;log(`🏦 Bank: ${r.data.withdrawable} withdrawable, chain:${r.data.onChainBalance||'?'}`)}}catch{}}
 
-function getSellDecision(defId, qty) {
-  const floor = PRICE_FLOOR[defId] || 1;
-  const qsPrice = QUICKSELL[defId] || 1;
-  const mktPrice = marketPrices[defId];
-  const depth = getMarketDepth(defId);
-  const trend = getPriceTrend(defId);
+// ============ PvP ============
+function pvpQueue(sock){if(level>=5&&stamina>=30){sock.emit('pvp:queue');stats.pvpQueued++;return true}return false}
 
-  if(MARKETPLACE_ONLY.has(defId)) {
-    if(!mktPrice || mktPrice < floor) return { action: 'HOLD', reason: `market ${mktPrice||0} < floor ${floor}`, floor };
-    const undercut = Math.max(floor, Math.floor(mktPrice * (1 - UNDERCUT_PCT)));
-    if(trend === 'falling' && qty > 3 && depth > 10) return { action: 'HOLD', reason: `falling, ${depth} listings`, floor };
-    return { action: 'MARKETPLACE', price: undercut, marketBest: mktPrice, depth, trend };
-  }
-
-  if(SAFE_QUICKSELL.has(defId)) {
-    if(mktPrice && mktPrice > qsPrice * 3) {
-      return { action: 'MARKETPLACE', price: Math.max(floor, Math.floor(mktPrice * (1 - UNDERCUT_PCT))), marketBest: mktPrice, depth, trend };
-    }
-    return { action: 'QUICKSELL', price: qsPrice };
-  }
-
-  if(mktPrice && mktPrice > floor) {
-    return { action: 'MARKETPLACE', price: Math.max(floor, Math.floor(mktPrice * (1 - UNDERCUT_PCT))), marketBest: mktPrice, depth, trend };
-  }
-
-  if(!mktPrice && floor > qsPrice * 2) return { action: 'HOLD', reason: 'no market data', floor };
-  return { action: 'QUICKSELL', price: qsPrice };
-}
-
-// ---- trade history + pending-sale notifier ----
-let tradeLog = [];      // {t, defId, qty, method, price, total}
-let pendingSales = [];  // batched for Telegram digest
-let lastCreditAt = 0;   // dedup: explicit result credits vs toast echoes
-
-// ---- hourly profit tracking (for dashboard chart) ----
-let hourlyProfit = {}; // hourKey (epoch hours) -> OTWN earned that hour
-function bucketEarn(amount) {
-  if(!amount || amount <= 0) return;
-  const k = Math.floor(Date.now() / 3600000);
-  hourlyProfit[k] = (hourlyProfit[k] || 0) + amount;
-  const keys = Object.keys(hourlyProfit).map(Number).sort((a,b)=>a-b);
-  while(keys.length > 48) delete hourlyProfit[keys.shift()]; // keep ~2 days
-}
-function getHourly(n = 12) {
-  const cur = Math.floor(Date.now() / 3600000);
-  const out = [];
-  for(let i = n - 1; i >= 0; i--) {
-    const k = cur - i;
-    const d = new Date(k * 3600000);
-    out.push({ h: String(d.getHours()).padStart(2,'0'), v: Math.round(hourlyProfit[k] || 0) });
-  }
-  return out;
-}
-
-function recordSale(defId, qty, method, price) {
-  const total = price * qty;
-  stats.totalRevenue += total;
-  stats.totalItemsSold += qty;
-  if(method === 'quickSell') { stats.soldQuick += qty; stats.earnedQuick += total; }
-  else { stats.soldMarket += qty; stats.earnedMarket += total; }
-  bucketEarn(total);
-  const rec = { t: Date.now(), defId, qty, method, price, total };
-  tradeLog.push(rec); if (tradeLog.length > 120) tradeLog.shift();
-  pendingSales.push(rec);
-  lastCreditAt = Date.now();
-  log(`💰 ${method==='quickSell'?'QS':'MKT'} ${defId} x${qty} @${price} = ${total} OTWN`);
-}
-function cleanName(id) { return String(id).replace(/^(mat_|fish_|wpn_|tool_|cos_|food_|med_|kit_|pet_|permit_)/, '').replace(/_/g, ' '); }
-
-function getProfitSummary() {
-  const mins = Math.floor((Date.now() - stats.startTime) / 60000);
-  const hours = mins / 60;
-  const totalEarned = stats.earnedQuick + stats.earnedMarket + stats.pvpEarnings + stats.propertyEarnings;
-  const rate = hours > 0 ? Math.round(totalEarned / hours) : 0;
-  let heldValue = 0;
-  for(const item of inventory) {
-    const floor = PRICE_FLOOR[item.defId] || QUICKSELL[item.defId] || 1;
-    heldValue += floor * item.qty;
-  }
-  return { totalEarned, rate, heldValue, qsEarned: stats.earnedQuick, mktEarned: stats.earnedMarket, itemsSold: stats.totalItemsSold, holdCount: stats.holdCount, hours: hours.toFixed(1) };
-}
-
-// ============ CRAFTING (v23: ALL RECIPES) ============
-function tryCraft(sock) {
-  for(const [recipeId, recipe] of Object.entries(GEAR_RECIPES)) {
-    let canCraft = true;
-    for(const [mat, qty] of Object.entries(recipe.needs)) {
-      const item = inventory.find(i => i.defId === mat && i.qty >= qty);
-      if(!item) { canCraft = false; break; }
-    }
-    if(canCraft && balance >= recipe.fee) {
-      sock.emit('inventory:craft', { recipeId });
-      stats.crafted++;
-      log(`🔨 Crafting ${recipeId} (fee: ${recipe.fee} OTWN)`);
-      notify(`🔨 <b>Craft</b> ${recipeId}\n💸 Fee: ${recipe.fee} OTWN`);
-      return true;
-    }
-  }
-  return false;
-}
-
-// ============ FOOD/HEALING (v23: SMART) ============
-function tryEatFood(sock) {
-  // Priority: med_patch > food items > fish
-  const food = inventory.find(i => i.defId === 'med_patch') ||
-               inventory.find(i => i.defId === 'food_ember_skewer') ||
-               inventory.find(i => i.defId === 'food_volt_noodles') ||
-               inventory.find(i => FOOD_ITEMS.has(i.defId));
-  if(food) {
-    sock.emit('inventory:use', { instanceId: food.instanceId });
-    stats.foodEaten++;
-    log(`🍖 Used ${food.defId} for healing`);
-    return true;
-  }
-  return false;
-}
-
-// ============ CLINIC HEALING ============
-function tryClinicHeal(sock) {
-  if(zone === 'clinic' && hp < HEAL_HP && balance >= 10) {
-    sock.emit('shop:clinicHeal');
-    stats.clinicHeals++;
-    notify(`🏥 <b>Clinic heal</b> @HP ${hp} · ~10 OTWN`);
-    log(`🏥 Clinic heal at HP:${hp}`);
-    return true;
-  }
-  return false;
-}
-
-// ============ BUY FOOD FROM SHOP ============
-function tryBuyFood(sock) {
-  if(balance >= 50 && zone === 'food_row') {
-    const foodCount = inventory.filter(i => FOOD_ITEMS.has(i.defId)).reduce((s,i) => s + i.qty, 0);
-    if(foodCount < 5) {
-      const fqty = Math.min(5, Math.floor(balance / 10));
-      sock.emit('shop:foodBuy', { defId: 'food_ember_skewer', qty: fqty });
-      stats.itemsBought++;
-      notify(`🛒 <b>Beli food</b> food_ember_skewer x${fqty} · ~${fqty*10} OTWN`);
-      log(`🛒 Buying food from shop`);
-      return true;
-    }
-  }
-  return false;
-}
-
-// ============ BANK (v23: AUTO DEPOSIT/WITHDRAW) ============
-async function checkBank(tok) {
-  try {
-    const res = await apiGet('/api/bank/status', tok);
-    if(res.status === 200 && res.data) {
-      bankInfo = res.data;
-      stats.bankBalance = res.data.withdrawable || 0;
-      log(`🏦 Bank: ${res.data.withdrawable?.toFixed(2)} OTWN (min: ${res.data.minWithdraw}, fee: ${res.data.feePercent}%)`);
-      return res.data;
-    }
-  } catch(e) { log(`🏦 Bank check failed: ${e.message}`); }
-  return null;
-}
-
-async function bankDeposit(sock, amount) {
-  if(balance > amount && amount >= 100) {
-    sock.emit('bank:deposit', { amount });
-    stats.bankDeposits++;
-    log(`🏦 Depositing ${amount} OTWN to bank`);
-  }
-}
-
-async function bankWithdraw(sock, amount) {
-  if(bankInfo && bankInfo.withdrawable >= amount && amount >= (bankInfo.minWithdraw || 5000)) {
-    sock.emit('bank:withdraw', { amount });
-    stats.bankWithdrawals++;
-    log(`🏦 Withdrawing ${amount} OTWN from bank`);
-  }
-}
-
-// ============ ECONOMY LEDGER ============
-function checkLedger(sock) {
-  sock.emit('economy:ledger');
-}
-
-// ============ PvP ARENA (v23: NEW!) ============
-function pvpQueue(sock) {
-  if(level >= 5 && stamina >= 30) {
-    sock.emit('pvp:queue');
-    stats.pvpQueued++;
-    log(`⚔️ PvP: Queued for arena`);
-    return true;
-  }
-  log(`⚔️ PvP: Need Lv5+ and 30+ stamina (Lv${level} STA:${stamina})`);
-  return false;
-}
-
-function pvpAttack(sock) {
-  sock.emit('pvp:attack');
-  stats.pvpFights++;
-  log(`⚔️ PvP: Attacking!`);
-}
-
-function pvpClaim(sock) {
-  sock.emit('pvp:claim');
-  log(`⚔️ PvP: Claiming rewards`);
-}
-
-function pvpLeave(sock) {
-  sock.emit('pvp:leave');
-  log(`⚔️ PvP: Left arena`);
-}
-
-// ============ PROPERTY (v23: NEW!) ============
-function checkProperty(sock) {
-  sock.emit('property:info', {});
-}
-
-function propertyBuy(sock, propertyId) {
-  sock.emit('property:buy', { propertyId });
-  stats.propertyBought++;
-  log(`🏠 Buying property ${propertyId}`);
-}
-
-function propertySell(sock, propertyId, price) {
-  sock.emit('property:sell', { propertyId, price });
-  log(`🏠 Listing property ${propertyId} @${price}`);
-}
-
-function propertyPark(sock, propertyId, vehicleId) {
-  sock.emit('property:park', { propertyId, vehicleId });
-  log(`🏠 Parking vehicle at property`);
-}
-
-// ============ VEHICLE (v23: NEW!) ============
-function vehicleBuy(sock, defId) {
-  if(balance >= 500) {
-    sock.emit('vehicle:buy', { defId });
-    stats.vehiclesBought++;
-    log(`🚗 Buying vehicle ${defId}`);
-    notify(`🚗 <b>Beli kendaraan</b> ${defId} · ≥500 OTWN`);
-  }
-}
-
-// ============ MARKET FLIP (measured, balance-safe, daily-capped) ============
-let lastFlipTime = 0;
-let buySpentToday = 0;
-let buyDay = new Date().toISOString().slice(0, 10);
-
-function spendableBalance() { return balance - config.balanceReserve; }
-function rolloverBuyDay() {
-  const today = new Date().toISOString().slice(0, 10);
-  if (today !== buyDay) { buyDay = today; buySpentToday = 0; }
-}
-// gate every purchase: respects reserve AND daily buy cap
-function canSpend(amount) {
-  rolloverBuyDay();
-  return spendableBalance() >= amount && (buySpentToday + amount) <= config.dailyBuyCap;
-}
-function recordSpend(amount) { rolloverBuyDay(); buySpentToday += amount; }
-
-function checkFlipOpportunities(sock, listings) {
-  if(!config.flipEnabled) return false;
-  if(!MY_PLAYER_ID) return false; // don't flip until we know our own id (avoid buying own listings)
-  if(Date.now() - lastFlipTime < config.flipCooldownSec * 1000) return false;
-  let bestFlip = null, bestProfit = 0;
-  for(const l of listings) {
-    if(l.sellerPlayerId === MY_PLAYER_ID || l.status !== 'active') continue;
-    if(!l.qty || l.qty < 1) continue;
-    const marketPrice = marketPrices[l.defId];
-    if(!marketPrice || marketPrice < 5) continue;
-    const ppu = l.price / l.qty;
-    const listingFee = Math.max(5, Math.round(l.price * 0.05));
-    const resaleRevenue = Math.round(marketPrice * l.qty * 0.92); // after ~8% resale fee
-    const totalCost = l.price + listingFee;
-    const profit = resaleRevenue - totalCost;
-    // aggressive: buy if priced under flipUnderprice of market, within budget + reserve
-    if(ppu < marketPrice * config.flipUnderprice && l.price <= config.flipMaxCost &&
-       profit >= config.flipMinProfit && canSpend(totalCost)) {
-      if(profit > bestProfit) { bestProfit = profit; bestFlip = { listing: l, ppu, marketPrice, profit, totalCost }; }
-    }
-  }
-  if(bestFlip) {
-    const l = bestFlip.listing;
-    log(`🔄 FLIP: ${l.defId} x${l.qty} @${l.price} (ppu:${bestFlip.ppu.toFixed(1)} mkt:${bestFlip.marketPrice} profit:${bestFlip.profit})`);
-    notify(`🔄 <b>Flip beli</b> ${cleanName(l.defId)} x${l.qty} @${l.price}\n<i>market ${bestFlip.marketPrice} · est profit +${bestFlip.profit}</i>`);
-    sock.emit('marketplace:buy', { listingId: l.id });
-    stats.itemsBought++; stats.itemsFlipped++;
-    recordSpend(bestFlip.totalCost);
-    lastFlipTime = Date.now();
-    return true;
-  }
-  return false;
-}
-
-// ============ AUTO-POWERUP (buy items that help leveling / sustained farming) ============
-// item -> { maxPrice: max OTWN/unit, maxQty: stop buying once we hold this many, equip?: weapon slot }
-const POWERUP_WANTS = {
-  kit_repair:        { maxPrice: 60,   maxQty: 5 },   // keep mining tool repaired
-  med_patch:         { maxPrice: 70,   maxQty: 6 },   // heal HP
-  food_ember_skewer: { maxPrice: 35,   maxQty: 10 },  // stamina -> more actions
-  food_volt_noodles: { maxPrice: 35,   maxQty: 10 },
-  wpn_rail_lance:    { maxPrice: 2500, maxQty: 1, equip: true }, // stronger weapon -> more kills -> XP
-};
-let lastPowerupTime = 0;
-function invCount(defId) { return inventory.filter(i => i.defId === defId).reduce((s, i) => s + i.qty, 0); }
-
-function checkPowerupBuys(sock, listings) {
-  if(!config.powerupEnabled || !MY_PLAYER_ID) return false;
-  if(Date.now() - lastPowerupTime < 15000) return false;
-  for(const [defId, want] of Object.entries(POWERUP_WANTS)) {
-    if(invCount(defId) >= want.maxQty) continue;
-    // cheapest active listing of this item within budget
-    let best = null;
-    for(const l of listings) {
-      if(l.sellerPlayerId === MY_PLAYER_ID || l.status !== 'active' || l.defId !== defId) continue;
-      const ppu = l.price / (l.qty || 1);
-      if(ppu <= want.maxPrice && canSpend(l.price)) {
-        if(!best || l.price < best.price) best = l;
-      }
-    }
-    if(best) {
-      log(`🆙 POWERUP buy: ${defId} x${best.qty} @${best.price}`);
-      notify(`🆙 <b>Beli powerup</b> ${cleanName(defId)} x${best.qty||1} @${best.price}`);
-      sock.emit('marketplace:buy', { listingId: best.id });
-      stats.itemsBought++;
-      recordSpend(best.price);
-      if(want.equip) pendingEquip = defId; // try to equip after it lands in inventory
-      lastPowerupTime = Date.now();
-      return true;
-    }
-  }
-  return false;
-}
-let pendingEquip = null;
-function tryEquipPending(sock) {
-  if(!pendingEquip) return;
-  const item = inventory.find(i => i.defId === pendingEquip && i.instanceId);
-  if(item) {
-    sock.emit('equipment:set', { instanceId: item.instanceId, slot: 'weapon' });
-    log(`🗡️ Equip ${pendingEquip}`);
-    notify(`🗡️ <b>Equip</b> ${cleanName(pendingEquip)}`);
-    pendingEquip = null;
-  }
-}
-
-// ============ WORLD BOSS (v23: FULL) ============
-function handleWorldBoss(sock) {
-  if(worldBossState && worldBossState.phase === 'active') {
-    if(!stats.worldBossActive) {
-      stats.worldBossActive = true;
-      log(`👹 WORLD BOSS ACTIVE! Entering...`);
-      sock.emit('worldboss:enter');
-    }
-  }
-}
-
-function claimBoss(sock) {
-  sock.emit('worldboss:claim');
-  stats.bossClaims++;
-  log(`🏆 Claiming world boss reward`);
-}
-
-function leaveBoss(sock) {
-  sock.emit('worldboss:leave');
-  stats.worldBossActive = false;
-  log(`👹 Left world boss`);
-}
-
-// ============ PORTAL (v23: NEW!) ============
-function enterPortal(sock) {
-  sock.emit('portal:enter');
-  stats.portalEntries++;
-  log(`🌀 Entering portal`);
-}
-
-// ============ NOTIFICATION (v23: NEW!) ============
-function readNotification(sock, notifId) {
-  sock.emit('notification:read', { id: notifId });
-}
-
-// ============ PROFILE (v23: NEW!) ============
-async function updateProfile(tok) {
-  try {
-    const res = await apiPost('/api/profile', { name: 'Elaina' }, tok);
-    if(res.status === 200) log(`👤 Profile updated`);
-  } catch(e) { /* silent */ }
-}
+// ============ FLIP / POWERUP ============
+let lastFlipTime=0,buySpentToday=0,buyDay=new Date().toISOString().slice(0,10);
+function rolloverBuyDay(){const d=new Date().toISOString().slice(0,10);if(d!==buyDay){buyDay=d;buySpentToday=0}}
+function canSpend(a){rolloverBuyDay();return(balance-config.balanceReserve)>=a&&(buySpentToday+a)<=config.dailyBuyCap}
+function recordSpend(a){rolloverBuyDay();buySpentToday+=a}
+function checkFlipOpportunities(sock,listings){if(!config.flipEnabled||!MY_PLAYER_ID||Date.now()-lastFlipTime<config.flipCooldownSec*1000)return false;let best=null,bp=0;for(const l of listings){if(l.sellerPlayerId===MY_PLAYER_ID||l.status!=='active'||!l.qty)continue;const mp=marketPrices[l.defId];if(!mp||mp<0.05)continue;const cost=l.price+Math.max(0.1,l.price*0.05);const rev=mp*l.qty*0.92;const p=rev-cost;if(l.price/l.qty<mp*config.flipUnderprice&&l.price<=config.flipMaxCost&&p>=config.flipMinProfit&&canSpend(cost)&&p>bp){bp=p;best={l,p,cost}}}if(best){sock.emit('marketplace:buy',{listingId:best.l.id});stats.itemsBought++;stats.itemsFlipped++;recordSpend(best.cost);lastFlipTime=Date.now();return true}return false}
+let lastPowerupTime=0,pendingEquip=null;
+const POWERUP_WANTS={kit_repair:{maxPrice:60,maxQty:5},med_patch:{maxPrice:70,maxQty:6},food_ember_skewer:{maxPrice:35,maxQty:10}};
+function checkPowerupBuys(sock,listings){if(!config.powerupEnabled||!MY_PLAYER_ID||Date.now()-lastPowerupTime<15000)return false;for(const[defId,want]of Object.entries(POWERUP_WANTS)){const have=inventory.filter(i=>i.defId===defId).reduce((s,i)=>s+i.qty,0);if(have>=want.maxQty)continue;let best=null;for(const l of listings){if(l.sellerPlayerId===MY_PLAYER_ID||l.status!=='active'||l.defId!==defId)continue;if(l.price/(l.qty||1)<=want.maxPrice&&canSpend(l.price)&&(!best||l.price<best.price))best=l}if(best){sock.emit('marketplace:buy',{listingId:best.id});stats.itemsBought++;recordSpend(best.price);lastPowerupTime=Date.now();return true}}return false}
 
 // ============ WALKING ============
-function walkStaged(sock, wps, idx, cb) {
-  if(!connected) return;
-  if(idx >= wps.length) { cb(); return; }
-  const wp = wps[idx];
-  let step = 0;
-  log(`  WP${idx+1}/${wps.length}:(${wp.x},${wp.z}) from(${pos.x.toFixed(1)},${pos.z.toFixed(1)})`);
-  const iv = setInterval(() => {
-    if(!connected) { clearInterval(iv); return; }
-    const dx = wp.x - pos.x, dz = wp.z - pos.z;
-    const dist = Math.sqrt(dx*dx + dz*dz);
-    if(dist < 2 || step >= MAX_WALK_STEPS) {
-      clearInterval(iv);
-      if(step > 0) log(`  Arrived WP${idx+1} zone:${zone} steps:${step}`);
-      for(let i = 0; i < 5; i++) sock.emit('player:input', {pos:{x:wp.x,y:0,z:wp.z},rotY:0,anim:'idle'});
-      setTimeout(() => walkStaged(sock, wps, idx+1, cb), 1000);
-      return;
-    }
-    pos.x += (dx/dist) * WALK_SPEED;
-    pos.z += (dz/dist) * WALK_SPEED;
-    sock.emit('player:input', {pos:{x:pos.x,y:0,z:pos.z},rotY:Math.atan2(dx,dz),anim:'walk'});
-    step++;
-  }, 100);
-}
+function walkStaged(sock,wps,idx,cb){if(!connected)return;if(idx>=wps.length){cb();return}const wp=wps[idx];let step=0;const iv=setInterval(()=>{if(!connected){clearInterval(iv);return}const dx=wp.x-pos.x,dz=wp.z-pos.z,dist=Math.sqrt(dx*dx+dz*dz);if(dist<2||step>=MAX_WALK_STEPS){clearInterval(iv);for(let i=0;i<5;i++)sock.emit('player:input',{pos:{x:wp.x,y:0,z:wp.z},rotY:0,anim:'idle'});setTimeout(()=>walkStaged(sock,wps,idx+1,cb),1000);return}pos.x+=(dx/dist)*WALK_SPEED;pos.z+=(dz/dist)*WALK_SPEED;sock.emit('player:input',{pos:{x:pos.x,y:0,z:pos.z},rotY:Math.atan2(dx,dz),anim:'walk'});step++},100)}
+function walkDirect(sock,target,cb){if(!connected){cb();return}let step=0;const iv=setInterval(()=>{if(!connected){clearInterval(iv);return}const dx=target.x-pos.x,dz=target.z-pos.z,dist=Math.sqrt(dx*dx+dz*dz);if(dist<5||step>=MAX_WALK_STEPS){clearInterval(iv);for(let i=0;i<5;i++)sock.emit('player:input',{pos:{x:target.x,y:0,z:target.z},rotY:0,anim:'idle'});setTimeout(cb,1000);return}pos.x+=(dx/dist)*WALK_SPEED;pos.z+=(dz/dist)*WALK_SPEED;sock.emit('player:input',{pos:{x:pos.x,y:0,z:pos.z},rotY:Math.atan2(dx,dz),anim:'walk'});step++},100)}
 
-function walkDirect(sock, target, cb) {
-  if(!connected) { cb(); return; }
-  let step = 0;
-  log(`  Walk direct to (${target.x},${target.z}) from(${pos.x.toFixed(1)},${pos.z.toFixed(1)})`);
-  const iv = setInterval(() => {
-    if(!connected) { clearInterval(iv); return; }
-    const dx = target.x - pos.x, dz = target.z - pos.z;
-    const dist = Math.sqrt(dx*dx + dz*dz);
-    if(dist < 5 || step >= MAX_WALK_STEPS) {
-      clearInterval(iv);
-      log(`  Direct walk done zone:${zone} steps:${step}`);
-      for(let i = 0; i < 5; i++) sock.emit('player:input', {pos:{x:target.x,y:0,z:target.z},rotY:0,anim:'idle'});
-      setTimeout(cb, 1000);
-      return;
-    }
-    pos.x += (dx/dist) * WALK_SPEED;
-    pos.z += (dz/dist) * WALK_SPEED;
-    sock.emit('player:input', {pos:{x:pos.x,y:0,z:pos.z},rotY:Math.atan2(dx,dz),anim:'walk'});
-    step++;
-  }, 100);
-}
+// ============ SELL ============
+function doSellPhase(sock,cb){if(!inventory.length){cb();return}tryCraft(sock);log(`💰 SELL ${inventory.length} stacks`);const old=[...myActiveListings];function cancelNext(i){if(i>=old.length){freshSell(sock,cb);return}sock.emit('marketplace:cancel',{listingId:old[i].id});stats.canceled++;setTimeout(()=>cancelNext(i+1),1500)}if(old.length>0)cancelNext(0);else freshSell(sock,cb)}
+function freshSell(sock,cb){const toM=[],toQ=[],toH=[];for(const item of inventory){if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')continue;const d=getSellDecision(item.defId,item.qty);if(d.action==='HOLD'){toH.push(item);stats.holdCount++}else if(d.action==='MARKETPLACE')toM.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty,price:d.price,marketBest:d.marketBest});else toQ.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty})}log(`📊 MKT:${toM.length} QS:${toQ.length} HOLD:${toH.length}`);function listNext(i){if(i>=toM.length||!connected){if(toQ.length)quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000);return}const m=toM[i];sock.emit('marketplace:list',{instanceId:m.instanceId,qty:m.qty,price:m.price*m.qty});log(`📋 ${m.defId} x${m.qty} @${m.price}/ea`);setTimeout(()=>listNext(i+1),MARKET_INTERVAL)}if(toM.length>0)listNext(0);else if(toQ.length){quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000)}else cb()}
+function quickSellSafe(sock,items){for(const it of items){if(!SAFE_QUICKSELL.has(it.defId)||!it.instanceId)continue;sock.emit('marketplace:quickSell',{instanceId:it.instanceId,qty:it.qty||1})}}
 
-// ============ SMART SELL (v23) ============
-function doSellPhase(sock, cb) {
-  if(dailyEarned >= DAILY_EARN_CAP) log(`⚠️ Over cap ${dailyEarned}/${DAILY_EARN_CAP} — still attempting sales`);
-  if(inventory.length === 0) { log('💰 Empty'); cb(); return; }
+// ============ ACTIONS ============
+function doActions(sock,type){if(!connected)return;currentActivity=type;const cfg=ACTIONS[type];let count=0,lastCatch=Date.now();const mon=getAliveMonster();const node=MINING_NODES[stats.currentNodeIdx%MINING_NODES.length];log(`▶ ${type} (max ${cfg.count})`);const iv=setInterval(()=>{if(!connected){clearInterval(iv);return}if(stats.consecutiveErrors>=5){clearInterval(iv);stats.consecutiveErrors=0;setTimeout(()=>runNextCycle(sock),2000);return}if(hp<LOW_HP)tryEatFood(sock);if(type==='fishing'&&fishingActive&&Date.now()-lastCatch>FISHING_TIMEOUT){clearInterval(iv);fishingActive=false;stats.fishingTimeouts++;setTimeout(()=>runNextCycle(sock),2000);return}if(count>=cfg.count){clearInterval(iv);if(type==='mining')stats.currentNodeIdx=(stats.currentNodeIdx+1)%MINING_NODES.length;if(type==='combat')stats.currentMonsterIdx=(stats.currentMonsterIdx+1)%Math.max(1,liveMonsters.length);setTimeout(()=>runNextCycle(sock),3000);return}if(type==='mining'){sock.emit('mining:start',{nodeId:node.id});count++}else if(type==='fishing'){if(!fishingActive){sock.emit('fishing:cast',{spotId:'fish_dock'});lastCatch=Date.now();count++}}else if(type==='combat'){sock.emit('combat:attack',{monsterId:mon.id});count++}else if(type==='pvp'){sock.emit('pvp:attack');stats.pvpFights++;count++}},cfg.interval)}
 
-  tryCraft(sock);
-
-  let totalValue = 0;
-  for(const item of inventory) {
-    const floor = PRICE_FLOOR[item.defId] || QUICKSELL[item.defId] || 1;
-    totalValue += floor * item.qty;
-  }
-  log(`💰 SELL — ${inventory.length} stacks (value: ~${totalValue} OTWN), daily ${dailyEarned}/${DAILY_EARN_CAP}`);
-
-  const oldListings = [...myActiveListings];
-  function cancelNext(idx) {
-    if(idx >= oldListings.length) { freshSell(sock, cb); return; }
-    sock.emit('marketplace:cancel', { listingId: oldListings[idx].id });
-    log(`🔄 Cancel: ${oldListings[idx].defId} @${oldListings[idx].price}`);
-    stats.canceled++;
-    setTimeout(() => cancelNext(idx + 1), 1500);
-  }
-  if(oldListings.length > 0) { log(`🔄 Cancel ${oldListings.length} old listings...`); cancelNext(0); }
-  else freshSell(sock, cb);
-}
-
-function freshSell(sock, cb) {
-  const toMarket = [], toQuickSell = [], toHold = [];
-
-  for(const item of inventory) {
-    if(KEEP.has(item.defId) || item.qty < 1 || item.status === 'locked') continue;
-    const decision = getSellDecision(item.defId, item.qty);
-    if(decision.action === 'HOLD') {
-      toHold.push({ defId: item.defId, qty: item.qty, reason: decision.reason });
-      stats.holdCount++;
-      stats.holdValue += (decision.floor || 1) * item.qty;
-    } else if(decision.action === 'MARKETPLACE') {
-      toMarket.push({
-        instanceId: item.instanceId, defId: item.defId, qty: item.qty,
-        price: decision.price, marketBest: decision.marketBest,
-        depth: decision.depth, trend: decision.trend
-      });
-    } else {
-      toQuickSell.push({ instanceId: item.instanceId, defId: item.defId, qty: item.qty });
-    }
-  }
-
-  toMarket.sort((a,b) => b.price - a.price);
-  const marketVal = toMarket.reduce((s,i) => s + i.price * i.qty, 0);
-  const qsVal = toQuickSell.reduce((s,i) => s + (QUICKSELL[i.defId]||1) * i.qty, 0);
-  const holdVal = toHold.reduce((s,i) => s + (PRICE_FLOOR[i.defId]||1) * i.qty, 0);
-
-  log(`📊 Market: ${toMarket.length} stacks (~${marketVal} OTWN)`);
-  log(`📊 QS: ${toQuickSell.length} stacks (~${qsVal} OTWN)`);
-  log(`📊 HOLD: ${toHold.length} stacks (~${holdVal} OTWN)`);
-  for(const m of toMarket) log(`  📋 ${m.defId} → market @${m.price} (best:${m.marketBest} depth:${m.depth} trend:${m.trend})`);
-  for(const h of toHold) log(`  ⏸️ ${h.defId} x${h.qty} — HOLD (${h.reason})`);
-
-  function listNext(idx) {
-    if(idx >= toMarket.length || !connected) {
-      if(toQuickSell.length > 0) {
-        const safeQS = toQuickSell.filter(i => SAFE_QUICKSELL.has(i.defId));
-        const blockedQS = toQuickSell.filter(i => !SAFE_QUICKSELL.has(i.defId));
-        if(blockedQS.length > 0) {
-          log(`🛑 BLOCKED ${blockedQS.length} items from QS (too valuable)`);
-          for(const b of blockedQS) log(`  ⏸️ ${b.defId} x${b.qty} — HOLD`);
-        }
-        if(safeQS.length > 0) {
-          const n = quickSellSafe(sock, safeQS);
-          log(`💰 QuickSell ${n} safe stacks (targeted — valuables protected)`);
-        }
-      }
-      setTimeout(() => {
-        const p = getProfitSummary();
-        log(`💰 Done: QS +${stats.earnedQuick} MKT +${stats.earnedMarket} Total: ${p.totalEarned}`);
-        cb();
-      }, 3000);
-      return;
-    }
-    const m = toMarket[idx];
-    sock.emit('marketplace:list', { instanceId: m.instanceId, qty: m.qty, price: m.price * m.qty });
-    log(`📋 ${m.defId} x${m.qty} @${m.price}/ea total:${m.price * m.qty} (best:${m.marketBest})`);
-    setTimeout(() => listNext(idx + 1), MARKET_INTERVAL);
-  }
-
-  if(toMarket.length > 0) { log(`📋 Listing ${toMarket.length} items...`); listNext(0); }
-  else if(toQuickSell.length > 0) {
-    const safeQS = toQuickSell.filter(i => SAFE_QUICKSELL.has(i.defId));
-    if(safeQS.length > 0) { const n = quickSellSafe(sock, safeQS); log(`💰 QuickSell ${n} safe stacks (targeted)`); }
-    setTimeout(() => { log(`💰 Done: QS +${stats.earnedQuick}`); cb(); }, 3000);
-  }
-  else if(toHold.length > 0) { log(`⏸️ All ${toHold.length} stacks on HOLD`); cb(); }
-  else { log('💰 Nothing sellable'); cb(); }
-}
-
-// Targeted terminal-sell of ONLY safe cheap mats, per item instance.
-// NEVER use marketplace:sellAll — the server applies it to the WHOLE inventory
-// (sells everything except gear/tools/vehicles at terminal price), which dumps
-// valuable fish/cores (e.g. Sun Carp, Resonance Core) for a few OTWN.
-function quickSellSafe(sock, items) {
-  let n = 0;
-  for(const it of items) {
-    if(!SAFE_QUICKSELL.has(it.defId) || !it.instanceId) continue;
-    sock.emit('marketplace:quickSell', { instanceId: it.instanceId, qty: it.qty || 1 });
-    n++;
-  }
-  return n;
-}
-
-// ============ ACTIONS (v23: ENHANCED) ============
-function doActions(sock, type) {
-  if(!connected) return;
-  currentActivity = type;
-  const cfg = ACTIONS[type];
-  let count = 0;
-  let lastCatchTime = Date.now();
-
-  const currentMon = MONSTERS[stats.currentMonsterIdx % MONSTERS.length];
-  const currentNode = MINING_NODES[stats.currentNodeIdx % MINING_NODES.length];
-
-  log(`Start ${type} (max ${cfg.count}) zone:${zone} ${type==='combat'?'mon:'+currentMon.id:''} ${type==='mining'?'node:'+currentNode.id:''}`);
-
-  const iv = setInterval(() => {
-    if(!connected) { clearInterval(iv); return; }
-
-    if(stats.consecutiveErrors >= 5) {
-      clearInterval(iv); log(`⚠️ err skip`); stats.consecutiveErrors = 0;
-      setTimeout(() => runNextCycle(sock), 2000); return;
-    }
-
-    // Fatigue check for mining
-    if(fatigueMultiplier < FATIGUE_THRESHOLD && type === 'mining') {
-      clearInterval(iv);
-      log(`⚠️ Fatigue ${fatigueMultiplier} < ${FATIGUE_THRESHOLD} — switching activity`);
-      stats.restCount++;
-      setTimeout(() => runNextCycle(sock), 2000);
-      return;
-    }
-
-    // HP check — eat food if low
-    if(hp < LOW_HP) {
-      tryEatFood(sock);
-    }
-
-    // Fishing timeout
-    if(type === 'fishing' && fishingActive && Date.now() - lastCatchTime > FISHING_TIMEOUT) {
-      clearInterval(iv);
-      log(`🎣 TIMEOUT — skip`);
-      stats.fishingTimeouts++;
-      fishingActive = false;
-      setTimeout(() => runNextCycle(sock), 2000);
-      return;
-    }
-
-    if(count >= cfg.count) {
-      clearInterval(iv);
-      if(type === 'mining') {
-        stats.currentNodeIdx = (stats.currentNodeIdx + 1) % MINING_NODES.length;
-        log(`⛏ Rotated to node: ${MINING_NODES[stats.currentNodeIdx].id}`);
-      }
-      if(type === 'combat') {
-        stats.currentMonsterIdx = (stats.currentMonsterIdx + 1) % MONSTERS.length;
-        log(`⚔ Rotated to monster: ${MONSTERS[stats.currentMonsterIdx].id}`);
-      }
-      setTimeout(() => {
-        log(`📊 ${type}:⛏${stats.mined} 🎣${stats.fished} ⚔${stats.kills} +${stats.xp}XP Lv${level} Bal:${balance.toFixed(2)}`);
-        setTimeout(() => runNextCycle(sock), 3000);
-      }, 2000);
-      return;
-    }
-
-    if(type === 'mining') {
-      sock.emit('mining:start', { nodeId: currentNode.id });
-      count++;
-    }
-    else if(type === 'fishing') {
-      if(!fishingActive) {
-        sock.emit('fishing:cast', { spotId: 'fish_dock' });
-        lastCatchTime = Date.now();
-        count++;
-      }
-    }
-    else if(type === 'combat') {
-      sock.emit('combat:attack', { monsterId: currentMon.id });
-      count++;
-    }
-    else if(type === 'pvp') {
-      pvpAttack(sock);
-      count++;
-    }
-  }, cfg.interval);
-}
-
-// ============ CYCLE (v23: ADDS PVP + SHOP + BANK) ============
-function runNextCycle(sock) {
-  if(!connected) return;
-  lastCycleStart = Date.now();
-  if(paused) {
-    // Idle while paused; re-check shortly. Watchdog won't fire because paused is excluded.
-    setTimeout(() => runNextCycle(sock), 5000);
-    return;
-  }
-  if(stats.consecutiveErrors >= 10) {
-    log(`⚠️ ${stats.consecutiveErrors} err — reconnect`);
-    sock.disconnect();
-    scheduleStart(5000);
-    return;
-  }
-
-  // Stamina check
-  if(stamina < LOW_STAMINA) {
-    log(`⚠️ Stamina ${stamina} < ${LOW_STAMINA} — eating food`);
-    tryEatFood(sock);
-  }
-
-  // HP check — go to clinic if very low
-  if(hp < LOW_HP && zone !== 'clinic') {
-    log(`⚠️ HP ${hp} < ${LOW_HP} — heading to clinic`);
-    walkDirect(sock, ZONE_TARGETS.clinic, () => {
-      tryClinicHeal(sock);
-      setTimeout(() => runNextCycle(sock), 2000);
-    });
-    return;
-  }
-
-  // World boss check
-  handleWorldBoss(sock);
-
-  stats.cycles++;
-
-  // v23: Enhanced cycle order with PvP and sell phases
-  const order = ['sell', 'mining', 'fishing', 'combat', 'pvp', 'mining', 'fishing', 'combat'];
-  const type = order[(stats.cycles - 1) % order.length];
-
-  // Sell phase — ENABLED: list/quicksell inventory to generate income (marketplace is global)
-  if(type === 'sell') {
-    checkLedger(sock);
-    doSellPhase(sock, () => { setTimeout(() => runNextCycle(sock), 1500); });
-    return;
-  }
-
-  // Skip PvP if not enough level/stamina
-  if(type === 'pvp' && (level < 5 || stamina < 30)) {
-    log(`⚔️ PvP skip: Lv${level} STA:${stamina}`);
-    stats.cycles++;
-    setTimeout(() => runNextCycle(sock), 1000);
-    return;
-  }
-
+// ============ CYCLE ============
+function runNextCycle(sock){
+  if(!connected)return;lastCycleStart=Date.now();
+  if(paused){setTimeout(()=>runNextCycle(sock),5000);return}
+  if(stats.consecutiveErrors>=10){sock.disconnect();scheduleStart(5000);return}
+  if(stamina<LOW_STAMINA)tryEatFood(sock);
+  if(worldBossState&&worldBossState.phase==='active'&&level>=(worldBossState.minLevel||10)&&!stats.worldBossActive){stats.worldBossActive=true;sock.emit('worldboss:enter');notify(`👹 <b>World Boss!</b> Entering`)}
+  stats.cycles++;stats.consecutiveErrors=0;
+  const type=decideNextAction();
   log(`\n=== Cycle ${stats.cycles}: ${type.toUpperCase()} ===`);
-
-  let waypoints;
-  if(type === 'mining') waypoints = getMiningWaypoints();
-  else if(type === 'combat') waypoints = getCombatWaypoints();
-  else if(type === 'pvp') {
-    // Walk to arena
-    waypoints = [{x:0,z:0}, {x:-80,z:0}, {x:ZONE_TARGETS.arena.x, z:ZONE_TARGETS.arena.z}];
-  }
-  else waypoints = WAYPOINTS_BASE[type] || [{x:0,z:0}];
-
-  walkStaged(sock, waypoints, 0, () => {
-    if(!connected) return;
-    const expected = EXPECTED_ZONE[type];
-    if(expected && zone !== expected && zone !== 'unknown') {
-      log(`⚠️ WRONG ZONE: expected ${expected}, got ${zone}`);
-      stats.wrongZone++;
-      reportError({ code: 'WRONG_ZONE', expected, zone, context: `expected ${expected}, got ${zone}` });
-      // Landed in a known-bad respawn zone repeatedly → skip this cycle to let position settle instead of walk-retrying.
-      if (ZONE_BLACKLIST.includes(zone)) { log(`⛔ landed in blacklisted ${zone} — skip cycle`); setTimeout(() => runNextCycle(sock), 2000); return; }
-      const target = ZONE_TARGETS[expected];
-      if(target) {
-        log(`🔄 Retrying walk to ${expected}...`);
-        walkDirect(sock, target, () => {
-          if(zone !== expected) {
-            log(`⚠️ Still wrong zone (${zone}), skip cycle`);
-            setTimeout(() => runNextCycle(sock), 2000);
-            return;
-          }
-          startAction(sock, type);
-        });
-        return;
-      }
-    }
-    startAction(sock, type);
+  if(type==='heal'){walkDirect(sock,ZONE_TARGETS.clinic,()=>{tryClinicHeal(sock);setTimeout(()=>runNextCycle(sock),2000)});return}
+  if(type==='eat'){tryEatFood(sock);setTimeout(()=>runNextCycle(sock),2000);return}
+  if(type==='sell'){sock.emit('economy:ledger');sock.emit('quest:action',{type:'check'});doSellPhase(sock,()=>setTimeout(()=>runNextCycle(sock),1500));return}
+  let wps;
+  if(type==='mining')wps=[{x:0,z:0},MINING_NODES[stats.currentNodeIdx%MINING_NODES.length].pos];
+  else if(type==='combat')wps=[{x:0,z:0},{x:-80,z:0},getAliveMonster().pos];
+  else if(type==='pvp')wps=[{x:0,z:0},ZONE_TARGETS.arena];
+  else wps=WAYPOINTS_BASE[type]||[{x:0,z:0}];
+  walkStaged(sock,wps,0,()=>{
+    if(!connected)return;
+    const exp=EXPECTED_ZONE[type];
+    if(exp&&zone!==exp&&zone!=='unknown'){stats.wrongZone++;reportError({code:'WRONG_ZONE',context:`need ${exp}, at ${zone}`});const t=ZONE_TARGETS[exp];if(t){walkDirect(sock,t,()=>{if(zone!==exp){setTimeout(()=>runNextCycle(sock),2000);return}doActions(sock,type)});return}}
+    if(type==='pvp'){pvpQueue(sock);doActions(sock,type)}else doActions(sock,type);
   });
-}
-
-function getMiningWaypoints() {
-  const node = MINING_NODES[stats.currentNodeIdx % MINING_NODES.length];
-  return [{x:0,z:0}, {x:node.pos.x, z:node.pos.z}];
-}
-
-function getCombatWaypoints() {
-  const mon = MONSTERS[stats.currentMonsterIdx % MONSTERS.length];
-  return [{x:0,z:0}, {x:-80,z:0}, {x:mon.pos.x, z:mon.pos.z}];
-}
-
-function startAction(sock, type) {
-  if(type === 'combat') {
-    const mon = MONSTERS[stats.currentMonsterIdx % MONSTERS.length];
-    walkDirect(sock, mon.pos, () => doActions(sock, type));
-  }
-  else if(type === 'mining') {
-    const node = MINING_NODES[stats.currentNodeIdx % MINING_NODES.length];
-    walkDirect(sock, node.pos, () => doActions(sock, type));
-  }
-  else if(type === 'pvp') {
-    pvpQueue(sock);
-    doActions(sock, type);
-  }
-  else doActions(sock, type);
 }
 
 // ============ MAIN BOT ============
-let fundingNotified = false;
-async function startBot() {
-  if (stopped) { log('⏹️ startBot skipped — bot is stopped'); return; }
-  // single-socket guard: cancel pending retry + tear down any old socket
-  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-  if (activeSocket) { try { activeSocket.removeAllListeners(); activeSocket.disconnect(); } catch (e) {} activeSocket = null; }
-  connected = false;
-  inventoryReady = false;
-  if(!token || isTokenExpired(token)) {
-    try { token = await authenticate(); }
-    catch(e) {
-      log('❌ Auth failed: ' + e.message);
-      if (/timeout/i.test(e.message)) reportError({ code: 'AUTH_TIMEOUT', context: 'auth request timeout', category: 'reconnect' });
-      // Auto-detect "needs funding": wallet must hold >= required OTWN to play
-      const m = e.message.match(/INSUFFICIENT_OTWN.*?"required":(\d+)/) || (e.message.includes('INSUFFICIENT_OTWN') ? [null, '5000'] : null);
-      if (m) {
-        if (!fundingNotified) {
-          fundingNotified = true;
-          notify(`⛽ <b>Wallet needs funding</b>\nHold at least <b>${m[1]} $OTWN</b> to enter Player Mode.\nWallet: <code>${WALLET_ADDR}</code>\nI'll keep checking every 5 min and auto-start once funded.`);
-        }
-        scheduleStart(300000); // slow 5-min retry while unfunded
-        return;
-      }
-      fundingNotified = false;
-      scheduleStart(30000);
-      return;
+let fundingNotified=false;
+async function startBot(){
+  if(stopped)return;
+  if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
+  if(activeSocket){try{activeSocket.removeAllListeners();activeSocket.disconnect()}catch{}activeSocket=null}
+  connected=false;inventoryReady=false;
+  if(!token||isTokenExpired(token)){
+    try{token=await authenticate()}catch(e){
+      log('❌ Auth: '+e.message);
+      if(/timeout/i.test(e.message))reportError({code:'AUTH_TIMEOUT',context:'auth timeout',category:'reconnect'});
+      if(e.message.includes('INSUFFICIENT_OTWN')){if(!fundingNotified){fundingNotified=true;notify(`⛽ <b>Need OTWN</b>\n<code>${WALLET_ADDR}</code>`)}scheduleStart(300000);return}
+      fundingNotified=false;scheduleStart(30000);return;
     }
-    fundingNotified = false; // auth succeeded -> reset for next time
+    fundingNotified=false;
   }
+  const socket=io('https://'+GAME_HOST,{auth:{token},transports:['polling'],upgrade:false,reconnection:false});
 
-  const socket = io('https://' + GAME_HOST, { auth: { token }, transports: ['polling'], upgrade: false, reconnection: false });
+  socket.on('player:correction',(d)=>{if(d.pos){pos.x=d.pos.x;pos.z=d.pos.z}});
+  socket.on('player:state',(d)=>{
+    if(d.zone)zone=d.zone;if(d.zoneName)zoneName=d.zoneName;if(d.mapId)mapId=d.mapId;
+    if(d.lockedBalance!==undefined)lockedBalance=d.lockedBalance;
+    if(d.withdrawableBalance!==undefined)withdrawableBalance=d.withdrawableBalance;
+    if(d.chipBalance!==undefined)chipBalance=d.chipBalance;
+    if(d.candyBalance!==undefined)candyBalance=d.candyBalance;
+    if(d.stats){playerStats=d.stats;if(d.stats.carryCapacity)CARRY_CAP=d.stats.carryCapacity}
+    if(d.equipmentBonuses)equipmentBonuses=d.equipmentBonuses;
+    if(d.equipment)equipment=d.equipment;
+    if(d.xpForNextLevel!==undefined)stats.xpForNext=d.xpForNextLevel;
+    if(d.gameBalance!==undefined){if(prevBalance!==null&&d.gameBalance<prevBalance){const drop=+(prevBalance-d.gameBalance).toFixed(2);if(drop>=20)notify(`📉 <b>-${drop}</b> · ${d.gameBalance.toFixed(0)} OTWN`)}prevBalance=d.gameBalance;balance=d.gameBalance}
+    if(d.level!==undefined){if(level&&d.level>level)notify(`⬆️ <b>Level ${d.level}!</b>`);level=d.level}
+    if(d.stamina!==undefined)stamina=d.stamina;
+    if(d.health!==undefined)hp=d.health;
+    if(d.stats&&d.stats.maxHealth)maxHp=d.stats.maxHealth;
+    if(d.dailyEarnedOtwn!==undefined)dailyEarned=d.dailyEarnedOtwn;
+    if(d.dailyEarnCap!==undefined&&d.dailyEarnCap>0)DAILY_EARN_CAP=d.dailyEarnCap;
+    const pid=d.playerId||d.id;if(pid&&!MY_PLAYER_ID){MY_PLAYER_ID=String(pid);log(`🆔 Player: ${MY_PLAYER_ID}`)}
+  });
+  socket.on('inventory:update',(d)=>{inventory=(d.items||[]).filter(i=>i.qty>0);if(!inventoryReady){inventoryReady=true;log(`📦 ${inventory.length} stacks`)}const tool=d.items.find(i=>i.defId==='tool_pulse_pick');if(tool&&tool.durability!==null&&tool.durability<LOW_DURABILITY&&tool.instanceId){socket.emit('inventory:repair',{instanceId:tool.instanceId});stats.repaired++}if(pendingEquip){const item=inventory.find(i=>i.defId===pendingEquip);if(item){socket.emit('equipment:set',{instanceId:item.instanceId,slot:'weapon'});pendingEquip=null}}});
+  socket.on('marketplace:update',(d)=>{if(d.listings){myActiveListings=d.listings.filter(l=>l.sellerPlayerId===MY_PLAYER_ID&&l.status==='active');scanMarketPrices(d.listings);if(!checkFlipOpportunities(socket,d.listings))checkPowerupBuys(socket,d.listings)}});
+  socket.on('mining:result',(d)=>{touchActivity();stats.mined++;stats.xp+=d.xpGained||0;stats.items+=d.qty||0;stats.consecutiveErrors=0;if(d.fatigueMultiplier!==undefined)fatigueMultiplier=d.fatigueMultiplier;log(`⛏ ${d.itemName} x${d.qty} +${d.xpGained}XP`)});
+  socket.on('mining:error',(d)=>{reportError({code:d.code,context:'mining'})});
+  socket.on('fishing:cast',()=>{fishingActive=true});
+  socket.on('fishing:result',(d)=>{touchActivity();fishingActive=false;stats.fished++;stats.xp+=d.xp||d.xpGained||0;stats.consecutiveErrors=0;log(`🎣 ${d.itemName||'fish'} x${d.qty||1} +${d.xp||0}XP`)});
+  socket.on('fishing:error',(d)=>{fishingActive=false;reportError({code:d.code,context:'fishing'})});
+  socket.on('combat:result',(d)=>{touchActivity();stats.fought++;stats.xp+=d.xpGained||0;stats.consecutiveErrors=0;if(d.playerHp!==undefined)hp=d.playerHp;if(d.killed){stats.kills++;log(`⚔ KILL +${d.xpGained}XP`)}});
+  socket.on('combat:error',(d)=>{reportError({code:d.code,context:'combat'})});
+  socket.on('combat:drop',(d)=>{stats.items++;log(`⚔ DROP ${d.itemName} x${d.qty}`)});
+  socket.on('worldboss:state',(d)=>{worldBossState=d;if(d.phase==='active'&&!stats.worldBossActive){stats.worldBossActive=true;socket.emit('worldboss:enter');notify(`👹 <b>World Boss!</b>`)}if(d.phase==='dead'){socket.emit('worldboss:claim');stats.bossClaims++}});
+  socket.on('pvp:state',(d)=>{pvpState=d});
+  socket.on('pvp:result',(d)=>{stats.pvpFights++;if(d.won){stats.pvpWins++;const r=d.reward||d.otwn||0;stats.pvpEarnings+=r;bucketEarn(r);log(`⚔️ PvP WIN +${r}`)}});
+  socket.on('pvp:leaderboardData',(d)=>{if(d.entries)log(`⚔️ PvP board: ${d.entries.length} entries, #1: ${d.entries[0]?.name||'?'}`)});
+  socket.on('quest:state',(d)=>{questState=d;log(`📜 Quest: ${d.activeId||'none'} step:${d.step||0} done:${(d.completed||[]).length}`)});
+  socket.on('quest:toast',(d)=>{notifySys(`📜 <b>${d.title}</b>\n${d.message}`)});
+  socket.on('candy:error',(d)=>{log(`🍬 ${d.code}: ${d.message||''}`)});
+  socket.on('casino:error',(d)=>{log(`🎰 ${d.code}: ${d.message||''}`)});
+  socket.on('casino:state',(d)=>{log(`🎰 Casino: ${JSON.stringify(d).slice(0,150)}`)});
+  socket.on('casino:result',(d)=>{log(`🎰 Result: ${JSON.stringify(d).slice(0,150)}`)});
+  socket.on('global:alert',(d)=>{notify(`🔔 <b>Alert</b>\n${d.message||JSON.stringify(d)}`)});
+  let lastSnapLog=0;
+  socket.on('world:snapshot',(d)=>{serverPlayerCount=d.playerCount||0;if(d.monsters)liveMonsters=d.monsters;if(d.players)livePlayers=d.players;if(Date.now()-lastSnapLog>60000){lastSnapLog=Date.now();log(`🌍 ${serverPlayerCount} online, ${liveMonsters.filter(m=>m.alive).length} mobs`)}});
+  socket.on('property:infoResult',(d)=>{log(`🏠 ${d.properties?.length||0} properties`)});
+  socket.on('property:result',(d)=>{if(d.ok&&d.earnings){stats.propertyEarnings+=d.earnings;bucketEarn(d.earnings)}});
+  socket.on('shop:result',(d)=>{if(d.ok)log(`🛒 ${d.item||d.action||'ok'}`)});
+  socket.on('economy:ledger',(d)=>{if(d.entries)economyLedger=d.entries});
+  socket.on('marketplace:result',(d)=>{if(d.ok&&d.credited)recordSale(d.defId||'qs',d.count||d.qty||1,'quickSell',d.credited)});
+  socket.on('marketplace:quickSell:result',(d)=>{if(d.credited)recordSale(d.defId||'qs',d.count||d.qty||1,'quickSell',d.credited)});
+  ['marketplace:list:result','marketplace:listed'].forEach(e=>socket.on(e,()=>{stats.listed++}));
+  socket.on('toast',(d)=>{if(d.kind==='success'){const msg=(d.message||'').toLowerCase();if((msg.includes('sold')||msg.includes('received'))&&Date.now()-lastCreditAt>3500){const m=d.message.match(/(\d[\d,.]*)\s*\$?OTWN/);if(m){const a=parseFloat(m[1].replace(/,/g,''));if(a>0)recordSale('market-sale',1,'marketplace',a)}}}});
+  socket.on('inventory:craft',(d)=>{log(`🔨 Crafted`)});
+  socket.on('inventory:repair',()=>{log('🔧 Repaired')});
+  socket.on('notifications',(d)=>{if(d.items)stats.notifications=d.items.length});
 
-  // === PLAYER STATE ===
-  socket.on('player:correction', (d) => { if(d.pos) { pos.x = d.pos.x; pos.z = d.pos.z; } });
-  socket.on('player:state', (d) => {
-    if(d.zone) zone = d.zone;
-    if(d.lockedBalance !== undefined) lockedBalance = d.lockedBalance;
-    if(d.withdrawableBalance !== undefined) withdrawableBalance = d.withdrawableBalance;
-    if(d.gameBalance !== undefined) {
-      if(prevBalance !== null && d.gameBalance < prevBalance) {
-        const drop = +(prevBalance - d.gameBalance).toFixed(2);
-        if(drop >= BALANCE_DROP_ALERT) {
-          // If locked went up by ~the same amount, the money is escrowed in
-          // market listings (recoverable), not actually spent.
-          const lockedHint = lockedBalance > 0 ? `\n🔒 Locked (listing/escrow): <b>${lockedBalance}</b> — kemungkinan dana ke-hold di listing, bukan hilang` : '';
-          notify(`📉 <b>Saldo turun ${drop} OTWN</b>\n💰 Spendable: <b>${d.gameBalance.toFixed(0)}</b> (dari ${prevBalance.toFixed(0)})${lockedHint}\n🏦 Withdrawable: ${withdrawableBalance}`);
-        }
-      }
-      prevBalance = d.gameBalance;
-      balance = d.gameBalance;
-    }
-    if(d.level !== undefined) {
-      if(level && d.level > level) notifySys(`⬆️ <b>Level up!</b> Now level ${d.level}`);
-      level = d.level;
-    }
-    if(d.stamina !== undefined) stamina = d.stamina;
-    if(d.dailyEarnedOtwn !== undefined) dailyEarned = d.dailyEarnedOtwn;
-    if(d.dailyEarnCap !== undefined && d.dailyEarnCap !== DAILY_EARN_CAP) {
-      DAILY_EARN_CAP = d.dailyEarnCap;
-      log(`📊 Server daily earn cap: ${DAILY_EARN_CAP} OTWN`);
-    }
-    if(d.hp !== undefined) hp = d.hp;
-    if(d.maxHp !== undefined) maxHp = d.maxHp;
-    // auto-detect our player id (used by flip/listing logic)
-    const pid = d.playerId || d.id || d.playerID;
-    if(pid && !MY_PLAYER_ID) { MY_PLAYER_ID = String(pid); log(`🆔 Detected player id: ${MY_PLAYER_ID}`); }
+  socket.on('connect',()=>{
+    connected=true;touchActivity();if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
+    log('Connected!');notifySys(`🟢 <b>Connected</b> — ${GAME_HOST}`);activeSocket=socket;
+    let started=false;
+    socket.on('player:correction',function onC(d){if(!started&&d.pos){pos.x=d.pos.x;pos.z=d.pos.z;started=true;socket.removeListener('player:correction',onC);log(`Pos:(${pos.x.toFixed(1)},${pos.z.toFixed(1)}) ${zoneName}`);waitInv(socket,()=>{socket.emit('economy:ledger');checkBank(token);socket.emit('property:info',{});socket.emit('candy:claim');runNextCycle(socket)})}});
+    setTimeout(()=>{if(!started){started=true;waitInv(socket,()=>runNextCycle(socket))}},3000);
   });
-
-  // === INVENTORY ===
-  socket.on('inventory:update', (d) => {
-    inventory = (d.items || []).filter(i => i.qty > 0);
-    if(!inventoryReady) { inventoryReady = true; log(`📦 ${inventory.length} stacks`); }
-    const tool = d.items.find(i => i.defId === 'tool_pulse_pick');
-    if(tool && tool.durability !== null && tool.durability < LOW_DURABILITY && tool.instanceId) {
-      log(`🔧 Repair dur:${tool.durability}`);
-      socket.emit('inventory:repair', { instanceId: tool.instanceId });
-      stats.repaired++;
-    }
-    tryEquipPending(socket); // equip a just-bought weapon once it lands in inventory
-  });
-
-  // === MARKETPLACE ===
-  socket.on('marketplace:update', (d) => {
-    if(d.listings) {
-      myActiveListings = d.listings.filter(l => l.sellerPlayerId === MY_PLAYER_ID && l.status === 'active');
-      scanMarketPrices(d.listings);
-      // smart auto-buy: flip underpriced for profit, then buy powerup/upgrade items
-      if(!checkFlipOpportunities(socket, d.listings)) checkPowerupBuys(socket, d.listings);
-    }
-  });
-
-  // === MINING ===
-  socket.on('mining:result', (d) => {
-    touchActivity();
-    stats.mined++; stats.xp += d.xpGained || 0; stats.items += d.qty || 0; stats.consecutiveErrors = 0;
-    if(d.fatigueMultiplier !== undefined) fatigueMultiplier = d.fatigueMultiplier;
-    if(d.fatigueMultiplier < 0.95) stats.fatigueDrops++;
-    const sp = getSellDecision(d.defId, d.qty);
-    log(`⛏ ${d.itemName} x${d.qty} +${d.xpGained}XP STA:${Math.round(d.stamina||0)} ${d.fatigueMultiplier<0.95?'⚠️fatigue':''} → ${sp.action}${sp.price?'@'+sp.price:''}`);
-  });
-  socket.on('mining:error', (d) => {
-    reportError({ code: d.code, context: `mining ${d.code}` });
-    if(d.code !== 'COOLDOWN') log(`⛏ ERR:${d.code}`);
-  });
-
-  // === FISHING ===
-  socket.on('fishing:cast', (d) => { fishingActive = true; log(`🎣 Wait ${Math.round(d.waitMs/1000)}s`); });
-  socket.on('fishing:result', (d) => {
-    touchActivity();
-    fishingActive = false; stats.fished++; stats.xp += d.xp || d.xpGained || 0; stats.items += d.qty || 1; stats.consecutiveErrors = 0;
-    const sp = getSellDecision(d.defId || 'fish', d.qty || 1);
-    log(`🎣 ${d.itemName||d.defId||'fish'} x${d.qty||1} +${d.xp||d.xpGained||0}XP → ${sp.action}${sp.price?'@'+sp.price:''}${sp.reason?' ('+sp.reason+')':''}`);
-  });
-  socket.on('fishing:error', (d) => { fishingActive = false; reportError({ code: d.code, context: `fishing ${d.code}`, zone }); log(`🎣 ERR:${d.code}`); });
-
-  // === COMBAT ===
-  socket.on('combat:result', (d) => {
-    touchActivity();
-    stats.fought++; stats.xp += d.xpGained || 0; stats.consecutiveErrors = 0;
-    if(d.playerHp !== undefined) hp = d.playerHp;
-    if(d.counterDamage > 0) log(`⚔ HIT:${d.damage} HP:${d.monsterHp} MY_HP:${hp} COUNTER:${d.counterDamage}`);
-    if(d.killed) { stats.kills++; log(`⚔ KILL! +${d.xpGained}XP`); }
-  });
-  socket.on('combat:error', (d) => {
-    reportError({ code: d.code, context: `combat ${d.code}` });
-    if(d.code === 'NO_TARGET') {
-      stats.currentMonsterIdx = (stats.currentMonsterIdx + 1) % MONSTERS.length;
-      log(`⚔ NO_TARGET → next monster: ${MONSTERS[stats.currentMonsterIdx].id}`);
-    } else if(d.code !== 'COOLDOWN') {
-      log(`⚔ ERR:${d.code}`);
-    }
-  });
-  socket.on('combat:drop', (d) => { stats.items++; log(`⚔ DROP: ${d.itemName} x${d.qty}`); });
-
-  // === WORLD BOSS (v23: FULL) ===
-  socket.on('worldboss:state', (d) => {
-    worldBossState = d;
-    if(d.phase === 'active' && !stats.worldBossActive) {
-      stats.worldBossActive = true;
-      log(`👹 WORLD BOSS ACTIVE! ${d.name || ''} HP:${d.hp}/${d.maxHp}`);
-      notifySys(`👹 <b>World Boss spawned!</b> ${d.name || ''} — auto-entering`);
-      socket.emit('worldboss:enter');
-    }
-    if(d.phase === 'dead') {
-      log(`👹 WORLD BOSS DEAD! Claiming...`);
-      claimBoss(socket);
-    }
-  });
-  socket.on('worldboss:result', (d) => {
-    if(d.claimed) {
-      stats.bossClaims++;
-      log(`🏆 BOSS CLAIMED! Rank #${d.rank} Reward: ${d.reward || '?'}`);
-    }
-  });
-
-  // === PvP ARENA (v23: NEW!) ===
-  socket.on('pvp:state', (d) => {
-    pvpState = d;
-    log(`⚔️ PvP state: ${d.status || d.phase || 'unknown'} ${d.opponent ? 'vs '+d.opponent : ''}`);
-    if(d.hp !== undefined) hp = d.hp;
-  });
-  socket.on('pvp:hit', (d) => {
-    log(`⚔️ PvP HIT: ${d.damage} to ${d.target} HP:${d.targetHp}`);
-    if(d.playerHp !== undefined) hp = d.playerHp;
-  });
-  socket.on('pvp:result', (d) => {
-    stats.pvpFights++;
-    if(d.won) {
-      stats.pvpWins++;
-      const reward = d.reward || d.otwn || 0;
-      stats.pvpEarnings += reward;
-      bucketEarn(reward);
-      log(`⚔️ PvP WIN! +${reward} OTWN +${d.xp||0}XP`);
-    } else {
-      log(`⚔️ PvP LOSS ${d.xp ? '+'+d.xp+'XP' : ''}`);
-    }
-  });
-  socket.on('pvp:leaderboard', (d) => {
-    if(d.entries) log(`⚔️ PvP leaderboard: ${d.entries.length} players, top: ${d.entries[0]?.name || '?'}`);
-  });
-  socket.on('pvp:leaderboardData', (d) => {
-    if(d.entries) log(`⚔️ PvP leaderboard data: ${d.entries.length} entries`);
-  });
-
-  // === PROPERTY (v23: NEW!) ===
-  socket.on('property:info', (d) => {
-    log(`🏠 Property info: ${d.properties?.length || 0} owned, ${d.available?.length || 0} available`);
-  });
-  socket.on('property:infoResult', (d) => {
-    log(`🏠 Property result: ${JSON.stringify(d).substring(0, 200)}`);
-  });
-  socket.on('property:result', (d) => {
-    if(d.ok) {
-      log(`🏠 Property action OK: ${d.action || 'unknown'}`);
-      if(d.action === 'buy') stats.propertyBought++;
-      if(d.action === 'sell') stats.propertySold++;
-      if(d.earnings) { stats.propertyEarnings += d.earnings; bucketEarn(d.earnings); }
-    } else {
-      log(`🏠 Property fail: ${d.code || d.message}`);
-    }
-  });
-  socket.on('property:entered', (d) => {
-    log(`🏠 Entered property: ${d.propertyId || d.name || '?'}`);
-  });
-
-  // === SHOP (v23: NEW!) ===
-  socket.on('shop:result', (d) => {
-    if(d.ok) {
-      log(`🛒 Shop OK: ${d.item || d.action || 'bought'}`);
-    } else {
-      log(`🛒 Shop fail: ${d.code || d.message}`);
-    }
-  });
-
-  // === ECONOMY (v23: NEW!) ===
-  socket.on('economy:ledger', (d) => {
-    if(d.entries) {
-      economyLedger = d.entries;
-      const recent = d.entries.slice(0, 5);
-      const fmtEntry = e => `${e.type || e.kind || e.reason || 'entry'}:${e.amount ?? e.delta ?? e.value ?? 0}`;
-      log(`📊 Ledger: ${d.entries.length} entries, recent: ${recent.map(fmtEntry).join(', ')}`);
-    }
-  });
-
-  // === PORTAL ===
-  socket.on('portal:enter', (d) => {
-    log(`🌀 Portal entered: ${d.destination || d.zone || '?'}`);
-  });
-
-  // === NOTIFICATIONS (v23: NEW!) ===
-  socket.on('notification', (d) => {
-    notifications.push(d);
-    stats.notifications++;
-    if(d.type === 'pvp_challenge' || d.type === 'boss_spawn') {
-      log(`🔔 Notif: ${d.type} — ${d.message || ''}`);
-    }
-  });
-
-  // === ADS (v23: NEW!) ===
-  socket.on('ads:update', (d) => {
-    if(d.ads) log(`📢 Ads update: ${d.ads.length} ads`);
-  });
-
-  // === CHAT (v23: NEW!) ===
-  socket.on('chat:message', (d) => {
-    // Silent — too noisy
-  });
-  socket.on('chat:history', (d) => {
-    if(d.messages) log(`💬 Chat history: ${d.messages.length} messages`);
-  });
-
-  // === CRAFTING ===
-  socket.on('inventory:craft', (d) => {
-    log(`🔨 Crafted: ${JSON.stringify(d).substring(0, 100)}`);
-  });
-
-  // === REPAIR ===
-  socket.on('inventory:repair', (d) => { log('🔧 Repaired!'); });
-
-  // === MARKETPLACE RESULTS ===
-  socket.on('marketplace:result', (d) => {
-    log(`🔍 MKT result: ${JSON.stringify(d).substring(0, 300)}`);
-    if(d.ok) {
-      if(d.action === 'cancel') { log(`✅ Canceled`); }
-      else if(d.credited) {
-        const defId = d.defId || d.itemId || 'quicksell';
-        const qty = d.count || d.qty || 1;
-        recordSale(defId, qty, 'quickSell', d.credited);
-      }
-      if(d.action === 'buy' && d.listingId) {
-        log(`🛒 Bought listing ${d.listingId}`);
-      }
-    } else log(`💰 Fail: ${d.code || d.message}`);
-  });
-
-  socket.on('marketplace:quickSell:result', (d) => {
-    if(d.credited) {
-      const defId = d.defId || d.itemId || 'quicksell';
-      const qty = d.count || d.qty || 1;
-      recordSale(defId, qty, 'quickSell', d.credited);
-    }
-  });
-
-  ['marketplace:list:result', 'marketplace:listed'].forEach(evt => {
-    socket.on(evt, (d) => { stats.listed++; log(`📋 Listed! ${JSON.stringify(d).substring(0, 100)}`); });
-  });
-
-  socket.on('marketplace:sellAll:result', (d) => {
-    log(`🔍 sellAll result: ${JSON.stringify(d).substring(0, 300)}`);
-    if(d.credited) {
-      recordSale('sellAll-bulk', d.count || d.items || 1, 'quickSell', d.credited);
-    }
-    if(d.items && Array.isArray(d.items)) {
-      for(const item of d.items) {
-        if(item.credited) {
-          recordSale(item.defId || 'item', item.qty || 1, 'quickSell', item.credited);
-        }
-      }
-    }
-  });
-
-  // === TOAST TRACKER ===
-  socket.on('toast', (d) => {
-    if(d.kind === 'success') {
-      const msg = (d.message || '').toLowerCase();
-      // Capture PASSIVE market sales (a buyer bought our listing) which only arrive via toast.
-      // Guard: skip if an explicit result credit fired in the last 3.5s (avoids double-count of sellAll/quicksell).
-      if((msg.includes('sold') || msg.includes('received')) && Date.now() - lastCreditAt > 3500) {
-        const m = d.message.match(/(\d[\d,]*)\s*\$?OTWN/);
-        if(m) { const amount = parseInt(m[1].replace(/,/g, '')); if(amount > 0) recordSale('market-sale', 1, 'marketplace', amount); }
-      }
-      if(msg.includes('list')) stats.listed++;
-      if(msg.includes('pvp') || msg.includes('arena')) {
-        log(`⚔️ PvP toast: ${d.message}`);
-      }
-      if(msg.includes('property') || msg.includes('house')) {
-        log(`🏠 Property toast: ${d.message}`);
-      }
-    }
-  });
-
-  // === CONNECTION ===
-  socket.on('connect', () => {
-    connected = true;
-    touchActivity();
-    if(retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    log('Connected!');
-    notifySys(`🟢 <b>Connected</b> — farming dimulai 🎮\n<i>${GAME_HOST}</i>`);
-    activeSocket = socket;
-    let started = false;
-    socket.on('player:correction', function onCorr(d) {
-      if(!started && d.pos) {
-        pos.x = d.pos.x; pos.z = d.pos.z; started = true;
-        socket.removeListener('player:correction', onCorr);
-        log(`Pos:(${pos.x.toFixed(1)},${pos.z.toFixed(1)}) zone:${zone}`);
-        waitForInventory(socket, () => {
-          // v23: Initial setup after connect
-          checkLedger(socket);
-          checkBank(token);
-          runNextCycle(socket);
-        });
-      }
-    });
-    setTimeout(() => {
-      if(!started) {
-        started = true;
-        waitForInventory(socket, () => runNextCycle(socket));
-      }
-    }, 3000);
-  });
-
-  socket.on('disconnect', (reason) => {
-    log('Disconnected! reason: ' + reason);
-    connected = false;
-    if (stopped) { log('⏹️ stopped — not reconnecting'); return; }
-    reportError({ code: reason, context: 'socket disconnect', category: 'reconnect' });
-    notifySys(`🔴 <b>Disconnected</b> — auto-reconnect in ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);
-    scheduleStart(RECONNECT_BACKOFF_MS);
-  });
-
-  socket.on('connect_error', (err) => {
-    const msg = (err && err.message) || 'connect_error';
-    log('⚠️ connect_error: ' + msg);
-    if (stopped) return;
-    reportError({ code: msg, context: 'connect_error', category: 'reconnect' });
-    if (/auth|token|unauthorized|forbidden|403|401/i.test(msg)) {
-      token = null;
-    }
-    try { socket.disconnect(); } catch {}
-    scheduleStart(5000);
-  });
-
-  function waitForInventory(sock, cb) {
-    if(inventoryReady) { cb(); return; }
-    log('⏳ Wait inv...');
-    let w = 0;
-    const iv = setInterval(() => {
-      w += 500;
-      if(inventoryReady || w > 5000) { clearInterval(iv); cb(); }
-    }, 500);
-  }
+  socket.on('disconnect',(r)=>{log('Disconnected: '+r);connected=false;if(stopped)return;reportError({code:r,context:'disconnect',category:'reconnect'});notifySys(`🔴 Disconnected — reconn ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);scheduleStart(RECONNECT_BACKOFF_MS)});
+  socket.on('connect_error',(err)=>{const msg=(err&&err.message)||'connect_error';log('⚠️ '+msg);if(stopped)return;reportError({code:msg,context:'connect_error',category:'reconnect'});if(/auth|token|unauthorized|forbidden|403|401/i.test(msg))token=null;try{socket.disconnect()}catch{}scheduleStart(5000)});
+  function waitInv(s,cb){if(inventoryReady){cb();return}let w=0;const iv=setInterval(()=>{w+=500;if(inventoryReady||w>5000){clearInterval(iv);cb()}},500)}
 }
 
-// ============ STATUS SUMMARY (shared by report + /status) ============
-function fmt(n) { return Number(n || 0).toLocaleString('en-US'); }
-function buildStatusText() {
-  const p = getProfitSummary();
-  const conn = connected ? '🟢' : '🔴';
-  const state = paused ? '⏸️ paused' : (connected ? '▶️ farming' : '⏳ offline');
-  const up = fmtUptime(Date.now() - stats.startTime);
-  return [
-    `${conn} <b>OWNTOWN BOT</b> · ${state}`,
-    `<i>⏱ ${up}  ·  📍 ${zone}  ·  🧍 Lv ${level}</i>`,
-    ``,
-    `💰 <b>Profit</b>`,
-    '<pre>' +
-      `Total      ${fmt(p.totalEarned)} OTWN\n` +
-      `Rate       ${fmt(p.rate)} /h\n` +
-      `QuickSell  +${fmt(stats.earnedQuick)}\n` +
-      `Market     +${fmt(stats.earnedMarket)}\n` +
-      `PvP        +${fmt(stats.pvpEarnings)}\n` +
-      `Items sold ${fmt(p.itemsSold)}` +
-    '</pre>',
-    `🏦 <b>Wallet</b>`,
-    '<pre>' +
-      `Balance    ${fmt(Math.round(balance))}\n` +
-      `Bank       ${fmt(stats.bankBalance)}\n` +
-      `Daily      ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}` +
-    '</pre>',
-    `🎒 <b>Character & Activity</b>`,
-    `❤️ ${hp}/${maxHp}   ⚡ ${stamina}   📦 ${inventory.length}/${CARRY_CAP}   ⏸ held ${stats.holdCount}`,
-    `⛏ ${fmt(stats.mined)}  🎣 ${fmt(stats.fished)}  ⚔ ${fmt(stats.kills)}  🛒 ${fmt(stats.itemsBought)}  🔨 ${fmt(stats.crafted)}  👹 ${fmt(stats.bossClaims)}`,
-    `${stats.errors ? '⚠️' : '✅'} errors ${stats.errors}   🔌 reconnects ${stats.reconnects || 0}   🌀 wrongzone ${stats.wrongZone}`,
-  ].join('\n');
-}
+// ============ FORMATTING ============
+function fmt(n){const v=Number(n||0);if(v>=1)return v.toLocaleString('en-US',{maximumFractionDigits:2});if(v>0)return v.toFixed(4);return'0'}
+function fmtUptime(ms){const s=Math.floor(ms/1000),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+'d ':'')+(h?h+'h ':'')+m+'m'}
+const esc=s=>String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
 
-// ============ DASHBOARD SNAPSHOT ============
-function fmtUptime(ms) {
-  const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm';
-}
-// ============ STATUS REPORT (configurable interval) ============
-setInterval(() => {
-  const statusText = buildStatusText();
-  log('\n' + statusText.replace(/<[^>]+>/g, '') + '\n');
-  notify(statusText);
-}, Math.max(1, config.reportIntervalMin) * 60000);
+// ============ REPORTS ============
+setInterval(()=>{const p=getProfitSummary();const t=[`${connected?'🟢':'🔴'} <b>v25</b> ${paused?'⏸️':connected?'▶️ '+currentActivity:'⏳'}`,`⏱${fmtUptime(Date.now()-stats.startTime)} 📍${zoneName} Lv${level}`,`💰${fmt(Math.round(balance))} earned:${fmt(p.totalEarned)} ${fmt(p.rate)}/h`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)}`].join('\n');log('\n'+t.replace(/<[^>]+>/g,'')+'\n');notify(t)},Math.max(1,config.reportIntervalMin)*60000);
 
-// ============ DAILY REPORT (once / 24h, or via /daily) ============
-let dailyBaseline = null;
-function snapDailyBaseline() {
-  const p = getProfitSummary();
-  dailyBaseline = {
-    t: Date.now(), balance, totalEarned: p.totalEarned, itemsSold: p.itemsSold,
-    buySpent: buySpentToday, mined: stats.mined, fished: stats.fished, kills: stats.kills,
-  };
-}
-function buildDailyReport() {
-  const p = getProfitSummary();
-  const b = dailyBaseline || { t: stats.startTime, balance, totalEarned: 0, itemsSold: 0, buySpent: 0, mined: 0, fished: 0, kills: 0 };
-  const hrs = Math.max(0.1, (Date.now() - b.t) / 3600000);
-  const earned = p.totalEarned - b.totalEarned;
-  const spent = buySpentToday - b.buySpent;            // flip/powerup buys (other fees are tiny)
-  const netBal = Math.round(balance - b.balance);
-  return [
-    `📅 <b>DAILY REPORT</b> · ~${hrs.toFixed(1)}h`,
-    '<pre>' +
-      `Earned       +${fmt(Math.round(earned))} OTWN\n` +
-      `Buy spent    -${fmt(Math.round(spent))} OTWN\n` +
-      `Net balance  ${netBal >= 0 ? '+' : ''}${fmt(netBal)} OTWN\n` +
-      `Daily cap    ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}\n` +
-      `Balance now  ${fmt(Math.round(balance))}\n` +
-      `Locked       ${fmt(lockedBalance)}\n` +
-      `Bank         ${fmt(stats.bankBalance)}\n` +
-      `Items sold   ${fmt(p.itemsSold - b.itemsSold)}\n` +
-      `⛏ ${fmt(stats.mined - b.mined)}  🎣 ${fmt(stats.fished - b.fished)}  ⚔ ${fmt(stats.kills - b.kills)}` +
-    '</pre>',
-  ].join('\n');
-}
-snapDailyBaseline();
-setInterval(() => { notify(buildDailyReport()); snapDailyBaseline(); }, 24 * 3600000);
+let dailyBaseline=null;
+function snapDaily(){const p=getProfitSummary();dailyBaseline={t:Date.now(),balance,totalEarned:p.totalEarned,mined:stats.mined,fished:stats.fished,kills:stats.kills}}
+function buildDaily(){const p=getProfitSummary();const b=dailyBaseline||{t:stats.startTime,balance,totalEarned:0,mined:0,fished:0,kills:0};const h=Math.max(0.1,(Date.now()-b.t)/3600000);return`📅 <b>DAILY</b> ~${h.toFixed(1)}h\n<pre>Earned +${fmt(Math.round(p.totalEarned-b.totalEarned))}\nBalance ${fmt(Math.round(balance))}\n⛏${fmt(stats.mined-b.mined)} 🎣${fmt(stats.fished-b.fished)} ⚔${fmt(stats.kills-b.kills)}</pre>`}
+snapDaily();setInterval(()=>{notify(buildDaily());snapDaily()},24*3600000);
 
-// ============ SALES DIGEST (near-real-time, batched ~2 min) ============
-setInterval(() => {
-  if (!pendingSales.length) return;
-  const count = pendingSales.reduce((s, r) => s + r.qty, 0);
-  const sum = pendingSales.reduce((s, r) => s + r.total, 0);
-  const lines = {};
-  for (const r of pendingSales) {
-    const k = cleanName(r.defId);
-    if (!lines[k]) lines[k] = { qty: 0, total: 0 };
-    lines[k].qty += r.qty; lines[k].total += r.total;
-  }
-  const body = Object.entries(lines).sort((a,b)=>b[1].total-a[1].total).slice(0,12)
-    .map(([k, v]) => `${k.padEnd(16).slice(0,16)} x${String(v.qty).padStart(3)}  +${fmt(v.total)}`).join('\n');
-  pendingSales = [];
-  const p = getProfitSummary();
-  notify(`🛒 <b>Terjual</b> ${count} item · +${fmt(sum)} OTWN\n<pre>${body}</pre>📍 ${currentActivity} · 💰 Total: ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h`);
-}, 120000);
+setInterval(()=>{if(!pendingSales.length)return;const count=pendingSales.reduce((s,r)=>s+r.qty,0);const sum=pendingSales.reduce((s,r)=>s+r.total,0);const lines={};for(const r of pendingSales){const k=cleanName(r.defId);if(!lines[k])lines[k]={qty:0,total:0};lines[k].qty+=r.qty;lines[k].total+=r.total}const body=Object.entries(lines).sort((a,b)=>b[1].total-a[1].total).slice(0,10).map(([k,v])=>`${k.padEnd(12).slice(0,12)} x${v.qty} +${fmt(v.total)}`).join('\n');pendingSales=[];notify(`🛒 <b>Sold</b> ${count} · +${fmt(sum)}\n<pre>${body}</pre>`)},120000);
 
-// ============ AUTOPILOT WATCHDOG ============
-// Detects "stuck" states the in-socket recovery misses and self-heals.
-const WATCHDOG_STUCK_MS = Math.max(2, config.watchdogStuckMin) * 60000;
-setInterval(() => {
-  if (paused || stopped) return;
-  const idle = Date.now() - lastActivity;
-  // 1) Connected but no game activity for too long -> kick the cycle / reconnect
-  if (connected && idle > WATCHDOG_STUCK_MS) {
-    log(`🐶 WATCHDOG: no activity for ${Math.round(idle/60000)}m — recovering`);
-    notifySys(`🐶 <b>Watchdog</b>: stuck ${Math.round(idle/60000)}m, restarting cycle`);
-    touchActivity(); // reset so we don't loop instantly
-    if (activeSocket && activeSocket.connected) {
-      try { runNextCycle(activeSocket); } catch (e) { log('🐶 cycle restart failed: ' + e.message); }
-    } else {
-      scheduleStart(2000);
-    }
-  }
-  // 2) Fully disconnected for way too long -> hard reconnect
-  if (!connected && idle > WATCHDOG_STUCK_MS * 2) {
-    log(`🐶 WATCHDOG: offline too long — hard restart`);
-    touchActivity();
-    scheduleStart(2000);
-  }
-}, 60000);
+// ============ WATCHDOG ============
+const WD_MS=Math.max(2,config.watchdogStuckMin)*60000;
+setInterval(()=>{if(paused||stopped)return;const idle=Date.now()-lastActivity;if(connected&&idle>WD_MS){log('🐶 WATCHDOG');touchActivity();if(activeSocket&&activeSocket.connected)try{runNextCycle(activeSocket)}catch{}else scheduleStart(2000)}if(!connected&&idle>WD_MS*2){touchActivity();scheduleStart(2000)}},60000);
 
 // ============ TELEGRAM COMMANDS ============
-const esc = s => String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+tg.on('help',()=>notify(['🏭 <b>OWNTOWN v25 — Smart Orchestrator</b>','','📊 /status /balance /daily /income /wallet','🎮 /inventory /market /trades /listings','📜 /quest /candy /boss /world /pvpboard','⚙️ /start /stop /pause /resume /reauth /restart /update','🔧 /health /errors /settings /schedule /log /ping','','<i>⚠️ 1 wallet = 1 sesi</i>'].join('\n')));
+tg.on('start',()=>{paused=false;stopped=false;if(connected){notify('▶️ Already farming.');return}notify('🚀 Connecting…');startBot()});
+tg.on('stop',()=>{stopped=true;paused=false;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false;notify('⏹️ <b>Stopped</b> — main manual.')});
+tg.on('status',()=>{const p=getProfitSummary(),up=fmtUptime(Date.now()-stats.startTime),alive=liveMonsters.filter(m=>m.alive).length;notify([`${connected?'🟢':'🔴'} <b>OWNTOWN v25</b> · ${paused?'⏸️':stopped?'⏹️':connected?'▶️ '+currentActivity:'⏳'}`,`<i>⏱${up} · 📍${zoneName} · Lv${level} (${stats.xp}/${stats.xpForNext||'?'}XP)</i>`,'','💰 <b>Economy</b>',`<pre>Balance  ${fmt(Math.round(balance))} OTWN\nCandy    ${fmt(candyBalance)}\nChip     ${fmt(chipBalance)}\nBank     ${fmt(stats.bankBalance)}\nEarned   ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h</pre>`,'',`🧍 ❤️${hp}/${maxHp} ⚡${stamina} 📦${inventory.length}/${CARRY_CAP}`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)} 🔨${fmt(stats.crafted)} 👹${fmt(stats.bossClaims)}`,`🌍 ${serverPlayerCount} online · ${alive}/${liveMonsters.length} mobs · boss:${worldBossState?.phase||'?'}`,`📜 Quest: ${questState?.activeId||'none'} (${(questState?.completed||[]).length} done)`,`${stats.errors?'⚠️':'✅'} err:${stats.errors} reconn:${stats.reconnects||0}`].join('\n'))});
+tg.on('stats',()=>tg.handlers['status']());
+tg.on('balance',()=>notify(`💰 <b>Balance</b>\n<pre>OTWN     ${fmt(Math.round(balance))}\nLocked   ${fmt(lockedBalance)}\nCandy    ${fmt(candyBalance)} 🍬\nChip     ${fmt(chipBalance)} 🎰\nBank     ${fmt(stats.bankBalance)}\nDaily    ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}</pre>`));
+tg.on('daily',()=>notify(buildDaily()));
+tg.on('income',()=>{const p=getProfitSummary();const hrs=getHourly(12).map(h=>`${h.h}:00 ${'█'.repeat(Math.min(10,Math.ceil(h.v/Math.max(1,...getHourly(12).map(x=>x.v))*10)))} +${fmt(h.v)}`).join('\n');notify(`💵 <b>Income</b>\n<pre>Total  ${fmt(p.totalEarned)}\nRate   ${fmt(p.rate)}/h\nQS     +${fmt(stats.earnedQuick)}\nMKT    +${fmt(stats.earnedMarket)}\nPvP    +${fmt(stats.pvpEarnings)}\nSold   ${fmt(p.itemsSold)}</pre>\n<pre>${hrs}</pre>`)});
+tg.on('wallet',()=>notify(`🔑 <b>Wallet</b>\n<code>${WALLET_ADDR||'auto'}</code>\n💰${fmt(Math.round(balance))} 🍬${fmt(candyBalance)} 🎰${fmt(chipBalance)}`));
+tg.on('quest',()=>{if(!questState){notify('📜 No quest data.');return}notify(`📜 <b>Quest</b>\nActive: <b>${questState.activeId||'none'}</b>\nStep: ${questState.step||0} Progress: ${questState.progress||0}\nDone: ${(questState.completed||[]).join(', ')||'none'}`)});
+tg.on('candy',async()=>{try{const h=await apiGet('/api/health');const e=h.data?.economy||{};notify(`🍬 <b>Candy</b>\nBalance: <b>${fmt(candyBalance)}</b>\n<pre>Price    $${e.candyUsd||'?'}\n1 CANDY  ${e.lastCandyOtwn||'?'} OTWN\nStaked   ${fmt(e.candyStaked)} OTWN\nPool     ${fmt(e.candyDailyPool)}/day\nMinted   ${fmt(e.candyMinted)}\nBurned   ${fmt(e.candyBurned)}\nVol 24h  ${fmt(e.candyVolume24h)}</pre>`)}catch(er){notify(`🍬 ${fmt(candyBalance)} (err: ${er.message})`)}});
+tg.on('boss',()=>{if(!worldBossState){notify('👹 No data.');return}const next=worldBossState.nextSpawnAt?new Date(worldBossState.nextSpawnAt).toISOString().slice(11,16):'?';notify(`👹 <b>World Boss</b>\nPhase: <b>${worldBossState.phase}</b>\nHP: ${worldBossState.hp||0}/${worldBossState.maxHp||500000}\nNext: ${next} UTC\nMin Lv: ${worldBossState.minLevel||10}\nClaims: ${stats.bossClaims}`)});
+tg.on('world',()=>{const zones={};for(const p of livePlayers)zones[p.zone]=(zones[p.zone]||0)+1;const zl=Object.entries(zones).sort((a,b)=>b[1]-a[1]).map(([z,c])=>`${z}:${c}`).join(' ');const alive=liveMonsters.filter(m=>m.alive);const ml=alive.map(m=>`${m.name||m.defId} Lv${m.level} ${m.hp}/${m.maxHp}`).join('\n')||'none';notify(`🌍 <b>World</b>\nPlayers: <b>${serverPlayerCount}</b>\nZones: ${zl||'?'}\nBoss: ${worldBossState?.phase||'?'}\n\n<b>Mobs</b>\n<pre>${ml}</pre>`)});
+tg.on('pvpboard',()=>{if(activeSocket)activeSocket.emit('pvp:leaderboard');notify('⚔️ Leaderboard requested — /log')});
+tg.on('market',()=>{if(!Object.keys(marketPrices).length){notify('📊 No data.');return}const rows=Object.entries(marketPrices).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v])=>{const t=getPriceTrend(k);return`${cleanName(k).padEnd(14).slice(0,14)} ${String(v).padStart(6)} ${t==='rising'?'📈':t==='falling'?'📉':'➡️'} ${getMarketDepth(k)}ea`}).join('\n');notify(`📊 <b>Market</b>\n<pre>${rows}</pre>`)});
+tg.on('trades',()=>{if(!tradeLog.length){notify('🧾 None.');return}const rows=tradeLog.slice(-15).reverse().map(r=>`${new Date(r.t).toLocaleTimeString('id',{hour:'2-digit',minute:'2-digit'})} ${r.method==='quickSell'?'QS':'MK'} ${cleanName(r.defId).slice(0,12)} +${fmt(r.total)}`).join('\n');notify(`🧾 <b>Trades</b>\n<pre>${rows}</pre>`)});
+tg.on('listings',()=>{if(!myActiveListings.length){notify('🏷️ None.');return}const r=myActiveListings.map(l=>`${cleanName(l.defId).slice(0,14)} x${l.qty||1} @${fmt(l.price)}`).join('\n');notify(`🏷️ <b>Listings</b>\n<pre>${r}</pre>`)});
+tg.on('inventory',()=>{if(!inventory.length){notify('🎒 Empty.');return}const s=[...inventory].sort((a,b)=>((PRICE_FLOOR[b.defId]||QUICKSELL[b.defId]||0)*b.qty)-((PRICE_FLOOR[a.defId]||QUICKSELL[a.defId]||0)*a.qty));const rows=s.slice(0,25).map(i=>{const v=(PRICE_FLOOR[i.defId]||QUICKSELL[i.defId]||0)*i.qty;return`${KEEP.has(i.defId)?'🔒':'  '}${cleanName(i.defId).padEnd(13).slice(0,13)} x${String(i.qty).padStart(3)} ~${fmt(v)}`}).join('\n');const t=inventory.reduce((s,i)=>s+(PRICE_FLOOR[i.defId]||QUICKSELL[i.defId]||0)*i.qty,0);notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP}) ~${fmt(t)}\n<pre>${rows}</pre>`)});
+tg.on('health',()=>{const m=process.memoryUsage();notify(`🩺 <b>Health</b>\n<pre>Game     ${connected?'🟢':'🔴'}\nToken    ${token&&!isTokenExpired(token)?'✅':'⚠️'}\nErrors   ${stats.errors} (${stats.consecutiveErrors})\nReconns  ${stats.reconnects||0}\nSchedule ${schedStatus()}\nMemory   ${(m.rss/1048576).toFixed(0)}MB\nUptime   ${fmtUptime(Date.now()-stats.startTime)}\nWorld    ${serverPlayerCount} online\nNode     ${process.version}</pre>`)});
+tg.on('errors',()=>{const e=LOG_RING.filter(l=>/ERR|❌|💥|⚠️|fail/i.test(l)).slice(-15);notify(`🧯 <b>Errors</b>\n<pre>${esc(e.join('\n'))||'none 🎉'}</pre>`)});
+tg.on('settings',()=>notify(`⚙️ <b>Settings</b>\n<pre>Schedule  ${scheduleActive?config.scheduleRaw:'off'}\nFlip      ${config.flipEnabled?'ON':'OFF'}\nReserve   ${fmt(config.balanceReserve)}\nPowerup   ${config.powerupEnabled?'ON':'OFF'}\nBuy today ${fmt(buySpentToday)}/${fmt(config.dailyBuyCap)}</pre>`));
+tg.on('log',(a)=>{const n=Math.min(50,Math.max(1,parseInt(a[0]||'15',10)||15));notify('<pre>'+esc(LOG_RING.slice(-n).join('\n')||'empty')+'</pre>')});
+tg.on('logs',(a)=>tg.handlers['log'](a));
+tg.on('pause',()=>{paused=true;notify('⏸️ Paused')});
+tg.on('resume',()=>{if(!paused){notify('▶️ Running.');return}paused=false;notify('▶️ Resumed');if(activeSocket&&activeSocket.connected)runNextCycle(activeSocket)});
+tg.on('reauth',()=>{notify('🔑 Re-auth…');token=null;try{if(activeSocket)activeSocket.disconnect()}catch{}setTimeout(startBot,1500)});
+tg.on('ping',()=>notify(`🏓 pong · ${connected?'🟢':'🔴'} · ${fmtUptime(Date.now()-stats.startTime)} · ${serverPlayerCount} online`));
+tg.on('schedule',()=>{const l=schedulePhases.map((p,i)=>`${i===schedIdx?'▶️':'  '} ${p.state.toUpperCase()} ${p.hours}h`).join('\n');notify(`🗓️ <b>Schedule</b>\n${scheduleActive?schedStatus():'off'}\n<pre>${l||'none'}</pre>`)});
+tg.on('restart',()=>{notify('♻️ Restarting…');setTimeout(()=>process.exit(0),800)});
+tg.on('update',()=>{notify('⬇️ Pulling…');const{execFile}=require('child_process');execFile('git',['-C',__dirname,'pull','--ff-only'],(e,o,s)=>{notify('<pre>'+esc(String(o||s||e).slice(0,600))+'</pre>');if(!e){notify('♻️ Restarting…');setTimeout(()=>process.exit(0),1000)}})});
 
-tg.on('help', () => notify([
-  '🏭 <b>OWNTOWN BOT v24 — Telegram Dashboard</b>',
-  '',
-  '📊 <b>Dashboard</b>',
-  '/status — full dashboard (wallet+profit+char+system)',
-  '/balance — saldo detail + locked + bank + daily cap',
-  '/daily — laporan harian (earned/spent/net)',
-  '/income — rincian pendapatan + grafik per jam',
-  '/wallet — info wallet + address',
-  '',
-  '🎮 <b>Activity</b>',
-  '/inventory — isi tas + estimasi nilai',
-  '/market — harga pasar terkini + tren',
-  '/trades — riwayat transaksi terakhir',
-  '/listings — listing aktif di marketplace',
-  '/map — posisi + zone + node/monster saat ini',
-  '',
-  '⚙️ <b>Control</b>',
-  '/start — bot ON (connect + farming)',
-  '/stop — bot OFF (lepas sesi, main manual)',
-  '/pause — jeda farming (tetap connect)',
-  '/resume — lanjut farming',
-  '/reauth — login ulang ke game',
-  '/restart — restart proses',
-  '/update — pull code terbaru + restart',
-  '',
-  '🔧 <b>System</b>',
-  '/health — kesehatan sistem lengkap',
-  '/errors — error terakhir + KB signatures',
-  '/selfix — status self-fix + autopatch',
-  '/schedule — jadwal anti-detect',
-  '/settings — konfigurasi aktif',
-  '/log [n] — log terakhir (default 15, max 50)',
-  '/ping — cek bot hidup',
-  '',
-  '<i>⚠️ 1 wallet = 1 sesi. Mau main manual? /stop dulu.</i>',
-].join('\n')));
+// ============ CRASH ============
+process.on('uncaughtException',(err)=>{log('💥 '+((err&&err.stack)||err));notify(`💥 <b>Crash</b>: ${err&&err.message||err}`);setTimeout(()=>process.exit(1),1200)});
+process.on('unhandledRejection',(r)=>{log('💥 unhandledRejection: '+((r&&r.stack)||r))});
 
-tg.on('start', () => {
-  paused = false; stopped = false;
-  if (connected) { notify('▶️ Already farming. /status for stats.'); return; }
-  notify('🚀 Bot ON — connecting + farming…\n<i>Pastikan kamu LOGOUT dari Owntown manual (1 wallet = 1 sesi).</i>');
-  startBot();
-});
-tg.on('stop', () => {
-  stopped = true; paused = false;
-  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-  try { if (activeSocket) activeSocket.disconnect(); } catch {}
-  connected = false;
-  notify('⏹️ <b>Bot OFF</b> — sesi game dilepas.\nSekarang kamu bebas main manual pakai wallet ini. Ketik /start kalau mau bot lanjut lagi.');
-  log('⏹️ Stopped via Telegram (manual play mode)');
-});
-
-tg.on('status', () => {
-  const p = getProfitSummary();
-  const conn = connected ? '🟢' : '🔴';
-  const state = paused ? '⏸️ paused' : stopped ? '⏹️ stopped' : (connected ? '▶️ farming' : '⏳ offline');
-  const up = fmtUptime(Date.now() - stats.startTime);
-  const mem = process.memoryUsage();
-  const invVal = inventory.reduce((s, i) => s + (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty, 0);
-  notify([
-    `${conn} <b>OWNTOWN BOT</b> · ${state}`,
-    `<i>⏱ ${up}  ·  📍 ${zone}  ·  🧍 Lv ${level}</i>`,
-    '',
-    `💰 <b>Wallet & Profit</b>`,
-    '<pre>' +
-      `Balance     ${fmt(Math.round(balance))} OTWN\n` +
-      `Locked      ${fmt(lockedBalance)}\n` +
-      `Bank        ${fmt(stats.bankBalance)}\n` +
-      `Daily       ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}\n` +
-      `───────────────────────\n` +
-      `Total earn  ${fmt(p.totalEarned)} OTWN\n` +
-      `Rate        ${fmt(p.rate)} /h\n` +
-      `QuickSell   +${fmt(stats.earnedQuick)}\n` +
-      `Market      +${fmt(stats.earnedMarket)}\n` +
-      `PvP         +${fmt(stats.pvpEarnings)}\n` +
-      `Items sold  ${fmt(p.itemsSold)}` +
-    '</pre>',
-    '',
-    `🧍 <b>Character</b>`,
-    `❤️ ${hp}/${maxHp}  ⚡ ${stamina}  📦 ${inventory.length}/${CARRY_CAP} (~${fmt(invVal)} OTWN)`,
-    '',
-    `🎯 <b>Activity Stats</b>`,
-    `⛏ ${fmt(stats.mined)}  🎣 ${fmt(stats.fished)}  ⚔ ${fmt(stats.kills)}  🔨 ${fmt(stats.crafted)}  👹 ${fmt(stats.bossClaims)}`,
-    `🛒 bought:${fmt(stats.itemsBought)}  🔄 flips:${fmt(stats.itemsFlipped)}  +${fmt(stats.flipProfit)} flip profit`,
-    '',
-    `🔧 <b>System</b>`,
-    `${stats.errors ? '⚠️' : '✅'} errors:${stats.errors} streak:${stats.consecutiveErrors}  🔌 reconn:${stats.reconnects||0}  🌀 wrongzone:${stats.wrongZone}`,
-    `📊 sched: ${schedStatus()}  💾 ${(mem.rss/1048576).toFixed(0)} MB`,
-  ].join('\n'));
-});
-tg.on('stats', () => tg.handlers['status']());
-
-tg.on('balance', () => {
-  const p = getProfitSummary();
-  notify([
-    `💰 <b>Balance Detail</b>`,
-    '<pre>' +
-    `Spendable    ${fmt(Math.round(balance))} OTWN\n` +
-    `Locked       ${fmt(lockedBalance)} (listing/escrow)\n` +
-    `Bank         ${fmt(stats.bankBalance)}\n` +
-    `Withdrawable ${fmt(withdrawableBalance)}\n` +
-    `Reserve      ${fmt(config.balanceReserve)} (jangan dipakai)\n` +
-    `───────────────────────\n` +
-    `Daily earned ${fmt(dailyEarned)} / ${fmt(DAILY_EARN_CAP)}\n` +
-    `Buy spent    ${fmt(buySpentToday)} / ${fmt(config.dailyBuyCap)}\n` +
-    `Total earned ${fmt(p.totalEarned)} OTWN` +
-    '</pre>',
-  ].join('\n'));
-});
-
-tg.on('daily', () => notify(buildDailyReport()));
-
-tg.on('income', () => {
-  const p = getProfitSummary();
-  const hrs = getHourly(12).map(h => `${h.h}:00  ${h.v > 0 ? '█'.repeat(Math.min(12, Math.ceil(h.v / (Math.max(1, ...getHourly(12).map(x=>x.v)) / 12)))) : '·'}  +${fmt(h.v)}`).join('\n');
-  notify([
-    `💵 <b>Income Breakdown</b>`,
-    '<pre>' +
-    `Total      ${fmt(p.totalEarned)} OTWN\n` +
-    `Rate       ${fmt(p.rate)} /h\n` +
-    `───────────────────────\n` +
-    `QuickSell  +${fmt(stats.earnedQuick)}\n` +
-    `Market     +${fmt(stats.earnedMarket)}\n` +
-    `PvP        +${fmt(stats.pvpEarnings)}\n` +
-    `Property   +${fmt(stats.propertyEarnings)}\n` +
-    `Flip prof  +${fmt(stats.flipProfit)}\n` +
-    `───────────────────────\n` +
-    `Sold       ${fmt(p.itemsSold)} items\n` +
-    `Held       ${fmt(stats.holdCount)} items (~${fmt(stats.holdValue)} OTWN)` +
-    '</pre>',
-    '',
-    `📈 <b>Per jam (12h)</b>`,
-    `<pre>${hrs}</pre>`,
-  ].join('\n'));
-});
-
-tg.on('wallet', () => {
-  notify([
-    `🔑 <b>Wallet Info</b>`,
-    `<code>${WALLET_ADDR || '(auto-derive on connect)'}</code>`,
-    ``,
-    `💰 ${fmt(Math.round(balance))} OTWN spendable`,
-    `🔒 ${fmt(lockedBalance)} locked`,
-    `🏦 ${fmt(stats.bankBalance)} in bank`,
-  ].join('\n'));
-});
-
-tg.on('market', () => {
-  if (!Object.keys(marketPrices).length) { notify('📊 Belum ada data market. Tunggu cycle sell berikutnya.'); return; }
-  const rows = Object.entries(marketPrices)
-    .filter(([k]) => PRICE_FLOOR[k])
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => {
-      const t = getPriceTrend(k);
-      const icon = t === 'rising' ? '📈' : t === 'falling' ? '📉' : '➡️';
-      const depth = getMarketDepth(k);
-      const floor = PRICE_FLOOR[k] || 0;
-      const name = cleanName(k).padEnd(18).slice(0, 18);
-      return `${name} ${fmt(v).padStart(6)}  ${icon} ${String(depth).padStart(2)} listings  floor:${floor}`;
-    }).join('\n');
-  notify(`📊 <b>Market Prices</b>\n<pre>${rows}</pre>\n<i>Update setiap sell cycle</i>`);
-});
-
-tg.on('trades', () => {
-  if (!tradeLog.length) { notify('🧾 Belum ada transaksi.'); return; }
-  const rows = tradeLog.slice(-20).reverse().map(r => {
-    const t = new Date(r.t).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-    const m = r.method === 'quickSell' ? 'QS' : 'MK';
-    const name = cleanName(r.defId).padEnd(14).slice(0, 14);
-    return `${t} ${m} ${name} x${String(r.qty).padStart(2)} +${fmt(r.total)}`;
-  }).join('\n');
-  const p = getProfitSummary();
-  notify(`🧾 <b>Transaksi Terakhir</b> (${tradeLog.length} total)\n<pre>${rows}</pre>\n💰 Total: ${fmt(p.totalEarned)} OTWN · ${fmt(p.rate)}/h`);
-});
-
-tg.on('listings', () => {
-  if (!myActiveListings.length) { notify('🏷️ Tidak ada listing aktif.'); return; }
-  const rows = myActiveListings.map(l => {
-    const name = cleanName(l.defId).padEnd(16).slice(0, 16);
-    return `${name} x${String(l.qty || 1).padStart(2)}  @${fmt(l.price)}`;
-  }).join('\n');
-  const total = myActiveListings.reduce((s, l) => s + l.price, 0);
-  notify(`🏷️ <b>Listing Aktif</b> (${myActiveListings.length})\n<pre>${rows}\n────────────────────\nTotal nilai: ${fmt(total)} OTWN</pre>`);
-});
-
-tg.on('map', () => {
-  const node = MINING_NODES[stats.currentNodeIdx % MINING_NODES.length];
-  const mon = MONSTERS[stats.currentMonsterIdx % MONSTERS.length];
-  notify([
-    `🗺️ <b>Position & Zone</b>`,
-    `📍 Zone: <b>${zone}</b>`,
-    `📌 Pos: (${Math.round(pos.x)}, ${Math.round(pos.z)})`,
-    `🎯 Activity: <b>${currentActivity}</b>`,
-    '',
-    '<pre>' +
-    `Mining node  ${node.id} (${node.pos.x},${node.pos.z})\n` +
-    `Monster      ${mon.id} [${mon.defId}] (${mon.pos.x},${mon.pos.z})\n` +
-    `Node idx     ${stats.currentNodeIdx % MINING_NODES.length}/${MINING_NODES.length}\n` +
-    `Monster idx  ${stats.currentMonsterIdx % MONSTERS.length}/${MONSTERS.length}` +
-    '</pre>',
-  ].join('\n'));
-});
-
-tg.on('log', (args) => {
-  const n = Math.min(50, Math.max(1, parseInt(args[0] || '15', 10) || 15));
-  const lines = LOG_RING.slice(-n).join('\n') || '(no logs yet)';
-  notify('<pre>' + esc(lines) + '</pre>');
-});
-tg.on('logs', (a) => tg.handlers['log'](a));
-
-tg.on('pause', () => { paused = true; log('⏸️ Paused via Telegram'); notify('⏸️ Farming <b>paused</b>. /resume to continue.'); });
-tg.on('resume', () => {
-  if (!paused) { notify('▶️ Already running.'); return; }
-  paused = false; log('▶️ Resumed via Telegram'); notify('▶️ Farming <b>resumed</b>.');
-  if (activeSocket && activeSocket.connected) runNextCycle(activeSocket);
-});
-
-tg.on('reauth', () => {
-  notify('🔑 Re-authenticating...'); token = null;
-  try { if (activeSocket) activeSocket.disconnect(); } catch {}
-  setTimeout(startBot, 1500);
-});
-tg.on('ping', () => notify(`🏓 <b>pong</b> · ${connected ? '🟢 online' : '🔴 offline'} · ⏱ ${fmtUptime(Date.now() - stats.startTime)}`));
-
-tg.on('schedule', () => {
-  const list = schedulePhases.map((p, i) => `${i === schedIdx ? '▶️' : '  '} ${p.state.toUpperCase()} ${p.hours}j`).join('\n');
-  notify(`🗓️ <b>Anti-detect Schedule</b>\n${scheduleActive ? schedStatus() : 'disabled'}\n<pre>${list || 'none'}</pre>`);
-});
-
-tg.on('health', () => {
-  const mem = process.memoryUsage();
-  const idleM = Math.round((Date.now() - lastActivity) / 60000);
-  notify([
-    `🩺 <b>System Health</b>`,
-    '<pre>' +
-    `Game       ${connected ? 'OK 🟢' : 'DOWN 🔴'}\n` +
-    `Telegram   ${tg.enabled ? 'OK 🟢' : 'DOWN 🔴'}\n` +
-    `Token      ${token && !isTokenExpired(token) ? 'valid ✅' : 'stale ⚠️'}\n` +
-    `Idle       ${idleM}m (watchdog @${config.watchdogStuckMin}m)\n` +
-    `Errors     ${stats.errors} (streak ${stats.consecutiveErrors})\n` +
-    `Reconnects ${stats.reconnects || 0}\n` +
-    `Wrong zone ${stats.wrongZone}\n` +
-    `Schedule   ${schedStatus()}\n` +
-    `Memory     ${(mem.rss/1048576).toFixed(0)} MB (heap ${(mem.heapUsed/1048576).toFixed(0)}/${(mem.heapTotal/1048576).toFixed(0)})\n` +
-    `Uptime     ${fmtUptime(Date.now() - stats.startTime)}\n` +
-    `Node       ${process.version}` +
-    '</pre>',
-  ].join('\n'));
-});
-
-tg.on('errors', () => {
-  const errs = LOG_RING.filter(l => /ERR|❌|💥|⚠️|fail/i.test(l)).slice(-12);
-  const top = errorBus.top(5).map(e => `${e.code} ×${e.count} [${e.status}]${e.lastAction ? ' ' + e.lastAction : ''}`);
-  notify(
-    '🧯 <b>Errors (KB top 5)</b>\n<pre>' + (esc(top.join('\n')) || 'none') + '</pre>\n' +
-    '<b>Recent log</b>\n<pre>' + (esc(errs.join('\n')) || 'none 🎉') + '</pre>'
-  );
-});
-
-tg.on('selfix', () => {
-  const top = errorBus.top(5).map(e => `${e.code} ×${e.count} [${e.status}]`);
-  let pend = 'none'; try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')).recipe; } catch {}
-  let backups = 0; try { backups = fs.readdirSync(BACKUP_DIR).length; } catch {}
-  notify([
-    '🩺 <b>Self-Fix System</b>',
-    '<pre>' +
-    `Blacklisted zones   ${esc(ZONE_BLACKLIST.join(', ') || 'none')}\n` +
-    `Reconnect backoff   ${RECONNECT_BACKOFF_MS}ms\n` +
-    `Pending patch       ${pend}\n` +
-    `Backups kept        ${backups}\n` +
-    `KB signatures       ${errorBus.all().length}` +
-    '</pre>',
-    '<b>Top signatures</b>',
-    '<pre>' + (esc(top.join('\n')) || 'none') + '</pre>',
-  ].join('\n'));
-});
-
-tg.on('inventory', () => {
-  if (!inventory.length) { notify('🎒 Inventory kosong.'); return; }
-  const sorted = [...inventory].sort((a, b) => {
-    const va = (PRICE_FLOOR[a.defId] || QUICKSELL[a.defId] || 0) * a.qty;
-    const vb = (PRICE_FLOOR[b.defId] || QUICKSELL[b.defId] || 0) * b.qty;
-    return vb - va;
-  });
-  const rows = sorted.slice(0, 30).map(i => {
-    const val = (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty;
-    const keep = KEEP.has(i.defId) ? '🔒' : '  ';
-    return `${keep}${cleanName(i.defId).padEnd(15).slice(0,15)} x${String(i.qty).padStart(3)}  ~${fmt(val)}`;
-  }).join('\n');
-  const totalVal = inventory.reduce((s, i) => s + (PRICE_FLOOR[i.defId] || QUICKSELL[i.defId] || 0) * i.qty, 0);
-  notify(`🎒 <b>Inventory</b> (${inventory.length}/${CARRY_CAP}) · ~${fmt(totalVal)} OTWN\n<pre>${rows}</pre>\n🔒 = keep (tidak dijual)`);
-});
-
-tg.on('settings', () => {
-  notify([
-    `⚙️ <b>Konfigurasi Aktif</b>`,
-    '<pre>' +
-    `Schedule        ${scheduleActive ? config.scheduleRaw : 'off'}\n` +
-    `Jitter          ±${config.scheduleJitterPct}%\n` +
-    `Report interval ${config.reportIntervalMin} min\n` +
-    `Watchdog        ${config.watchdogStuckMin} min\n` +
-    `Notif profit    ${config.notifyProfitOnly ? 'ON' : 'OFF'}\n` +
-    `Daily earn cap  ${fmt(DAILY_EARN_CAP)}\n` +
-    `───────────────────────\n` +
-    `Flip            ${config.flipEnabled ? 'ON' : 'OFF'}\n` +
-    `Flip underprice <${Math.round(config.flipUnderprice*100)}% market\n` +
-    `Flip max cost   ${fmt(config.flipMaxCost)}\n` +
-    `Flip cooldown   ${config.flipCooldownSec}s\n` +
-    `Flip min profit ${fmt(config.flipMinProfit)}\n` +
-    `Balance reserve ${fmt(config.balanceReserve)}\n` +
-    `Daily buy cap   ${fmt(config.dailyBuyCap)}\n` +
-    `Powerup         ${config.powerupEnabled ? 'ON' : 'OFF'}\n` +
-    `Buy spent today ${fmt(buySpentToday)} / ${fmt(config.dailyBuyCap)}` +
-    '</pre>',
-    '<i>Edit .env di VPS lalu /restart</i>',
-  ].join('\n'));
-});
-
-tg.on('restart', () => { notify('♻️ Restarting process...'); setTimeout(() => process.exit(0), 800); });
-tg.on('update', () => {
-  notify('⬇️ Pulling latest code from git...');
-  const { execFile } = require('child_process');
-  execFile('git', ['-C', __dirname, 'pull', '--ff-only'], (err, out, stderr) => {
-    notify('<pre>' + esc(String(out || stderr || err).slice(0, 600)) + '</pre>');
-    if (!err) { notify('♻️ Restarting with new code...'); setTimeout(() => process.exit(0), 1000); }
-  });
-});
-
-// ============ CRASH RECOVERY ============
-process.on('uncaughtException', (err) => {
-  log('💥 uncaughtException: ' + (err && err.stack || err));
-  // If an autopatch is pending/unverified, a crash likely means the patch broke us → roll it back
-  // instead of crash-looping into the same broken bot.js forever.
-  let pend; try { pend = JSON.parse(fs.readFileSync(PENDING_PATCH, 'utf8')); } catch {}
-  if (pend) {
-    notify(`💥 <b>Crash after AutoPatch</b> ${pend.recipe}: ${err && err.message || err} — rolling back.`);
-    rollbackPatch(pend, 'crashed after patch');
-    return;
-  }
-  notify(`💥 <b>Crash</b>: ${err && err.message || err}\nProcess will exit; systemd auto-restarts.`);
-  setTimeout(() => process.exit(1), 1200); // let the notify flush, then let systemd restart
-});
-process.on('unhandledRejection', (reason) => {
-  log('💥 unhandledRejection: ' + (reason && reason.stack || reason));
-});
-
-// ============ ANTI-DETECTION SCHEDULE ============
-// Human-like online/offline pattern, e.g. SCHEDULE="on:18,off:2,on:1,off:3"
-let schedulePhases = [];
-let schedIdx = 0;
-let schedPhaseEnd = 0;
-const scheduleActive = config.scheduleEnabled;
-function parseSchedule(raw) {
-  return raw.split(',').map(s => {
-    const [st, h] = s.split(':');
-    return { state: (st || '').trim().toLowerCase() === 'off' ? 'off' : 'on', hours: parseFloat(h) || 1 };
-  }).filter(p => p.hours > 0);
-}
-function jitterMs(hours) {
-  const j = config.scheduleJitterPct / 100;
-  return Math.round(hours * 3600000 * (1 + (Math.random() * 2 - 1) * j));
-}
-function schedUntilStr() { return new Date(schedPhaseEnd).toISOString().slice(11, 16); }
-function applyPhase(announce) {
-  const p = schedulePhases[schedIdx];
-  if (!p) return;
-  schedPhaseEnd = Date.now() + jitterMs(p.hours);
-  if (p.state === 'on') {
-    log(`🗓️ Schedule ON (~${p.hours}h → ~${schedUntilStr()} UTC)`);
-    if (stopped) { stopped = false; startBot(); }
-  } else {
-    log(`🗓️ Schedule OFF (~${p.hours}h → ~${schedUntilStr()} UTC)`);
-    stopped = true;
-    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    try { if (activeSocket) activeSocket.disconnect(); } catch {}
-    connected = false;
-  }
-  if (announce) notifySys(`🗓️ <b>Jadwal: ${p.state.toUpperCase()}</b> ~${p.hours}j (s/d ~${schedUntilStr()} UTC)`);
-}
-function schedStatus() {
-  if (!scheduleActive || !schedulePhases.length) return 'disabled';
-  const p = schedulePhases[schedIdx];
-  const mins = Math.max(0, Math.round((schedPhaseEnd - Date.now()) / 60000));
-  return `${p.state.toUpperCase()} · sisa ~${Math.floor(mins/60)}h ${mins%60}m`;
-}
-if (scheduleActive) {
-  schedulePhases = parseSchedule(config.scheduleRaw);
-  if (schedulePhases.length) applyPhase(false);
-}
-setInterval(() => {
-  if (!scheduleActive || !schedulePhases.length) return;
-  if (Date.now() >= schedPhaseEnd) { schedIdx = (schedIdx + 1) % schedulePhases.length; applyPhase(true); }
-}, 30000);
+// ============ SCHEDULE ============
+let schedulePhases=[],schedIdx=0,schedPhaseEnd=0;
+const scheduleActive=config.scheduleEnabled;
+function parseSchedule(raw){return raw.split(',').map(s=>{const[st,h]=s.split(':');return{state:(st||'').trim().toLowerCase()==='off'?'off':'on',hours:parseFloat(h)||1}}).filter(p=>p.hours>0)}
+function jitterMs(h){return Math.round(h*3600000*(1+(Math.random()*2-1)*config.scheduleJitterPct/100))}
+function schedUntilStr(){return new Date(schedPhaseEnd).toISOString().slice(11,16)}
+function applyPhase(ann){const p=schedulePhases[schedIdx];if(!p)return;schedPhaseEnd=Date.now()+jitterMs(p.hours);if(p.state==='on'){if(stopped){stopped=false;startBot()}}else{stopped=true;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false}if(ann)notifySys(`🗓️ <b>${p.state.toUpperCase()}</b> ~${p.hours}h`)}
+function schedStatus(){if(!scheduleActive||!schedulePhases.length)return'off';const p=schedulePhases[schedIdx],m=Math.max(0,Math.round((schedPhaseEnd-Date.now())/60000));return`${p.state.toUpperCase()} ~${Math.floor(m/60)}h${m%60}m`}
+if(scheduleActive){schedulePhases=parseSchedule(config.scheduleRaw);if(schedulePhases.length)applyPhase(false)}
+setInterval(()=>{if(!scheduleActive||!schedulePhases.length)return;if(Date.now()>=schedPhaseEnd){schedIdx=(schedIdx+1)%schedulePhases.length;applyPhase(true)}},30000);
 
 // ============ BOOT ============
-log('🚀 Starting v24 — PvP+Property+Shop+Crafting+Bank+Vehicle + Telegram Dashboard + Autopilot...');
-verifyPendingPatchOnBoot();
+log('🚀 v25 Smart Orchestrator starting…');
 tg.startPolling();
-notifySys('🚀 <b>Owntown Bot v24</b> menyala — menghubungkan ke game…\n<i>/help untuk daftar perintah · /status untuk dashboard live</i>');
+notifySys('🚀 <b>Owntown v25</b> — Smart Orchestrator\n<i>/help commands · /status dashboard</i>');
 startBot();
