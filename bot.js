@@ -61,7 +61,7 @@ function scheduleStart(ms) {
   retryTimer = setTimeout(() => { retryTimer = null; startBot(); }, ms);
 }
 
-log('=== OWNTOWN SMART FARMER v25.0.2 ===');
+log('=== OWNTOWN SMART FARMER v25.0.3 ===');
 log('AUTO ORCHESTRATOR: Mining+Fishing+Combat+PvP+Quest+Candy+Market+Bank+Crafting');
 
 // ============ CONSTANTS ============

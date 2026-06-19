@@ -35,7 +35,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-
 ### Pinned release install
 
 ```bash
-OWNTOWN_REF=v25.0.2 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
+OWNTOWN_REF=v25.0.3 bash <(curl -fsSL https://raw.githubusercontent.com/rygroup-dev/owntown-farming-bot/main/install.sh)
 ```
 
 ### Manual install
