@@ -96,7 +96,7 @@ const QUICKSELL = {
 const KEEP = new Set(['tool_pulse_pick','cos_coastal_tee','cos_palm_sneakers','kit_repair','med_patch','food_ember_skewer','food_volt_noodles','pet_demon_salamander','pet_golden_whale','pet_sea_dragon','permit_redline','gear_driftwood_baton']);
 const MARKETPLACE_ONLY = new Set(['fish_sun_carp','fish_moon_koi','fish_void_angler','fish_abyssal_lantern','fish_golden_koi','fish_silver_darter','mat_resonance_core','gear_resonite_edge','gear_fault_greaves','gear_volt_anklets']);
 const SAFE_QUICKSELL = new Set(['mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber']);
-const FOOD_ITEMS = new Set(['food_ember_skewer','food_volt_noodles','med_patch','fish_silver_darter','fish_sun_carp','fish_moon_koi']);
+const FOOD_ITEMS = new Set(['food_ember_skewer','food_volt_noodles','med_patch']);
 
 const GEAR_RECIPES = {
   'craft_repair_kit': { needs: { mat_iron_shard: 2, mat_carbon_fiber: 1 }, fee: 5 },
@@ -183,7 +183,39 @@ let token=getToken();
 function scanMarketPrices(listings){const best={},counts={};for(const l of listings){if(l.status!=='active')continue;const ppu=l.price/(l.qty||1);if(!best[l.defId]||ppu<best[l.defId])best[l.defId]=ppu;counts[l.defId]=(counts[l.defId]||0)+1;}marketPrices=best;marketHistory.push({time:Date.now(),prices:{...best},counts:{...counts}});if(marketHistory.length>100)marketHistory.shift();for(const[defId,price]of Object.entries(best)){if(!stats.avgPrices[defId]){stats.avgPrices[defId]=price;stats.priceSamples[defId]=1}else{stats.priceSamples[defId]++;stats.avgPrices[defId]=stats.avgPrices[defId]*0.9+price*0.1;}}}
 function getMarketDepth(defId){const l=marketHistory[marketHistory.length-1];return l?(l.counts[defId]||0):0}
 function getPriceTrend(defId){if(marketHistory.length<3)return'stable';const r=marketHistory.slice(-3).map(h=>h.prices[defId]).filter(Boolean);if(r.length<2)return'stable';const avg=r.reduce((a,b)=>a+b,0)/r.length;const c=(r[r.length-1]-avg)/avg;return c>0.1?'rising':c<-0.1?'falling':'stable'}
-function getSellDecision(defId,qty){const floor=PRICE_FLOOR[defId]||0.01;const qsPrice=QUICKSELL[defId]||1;const mktPrice=marketPrices[defId];const depth=getMarketDepth(defId);const trend=getPriceTrend(defId);if(MARKETPLACE_ONLY.has(defId)){if(!mktPrice||mktPrice<floor)return{action:'HOLD',reason:`mkt<floor`,floor};const undercut=Math.max(floor,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10);return{action:'MARKETPLACE',price:undercut,marketBest:mktPrice,depth,trend}}if(SAFE_QUICKSELL.has(defId))return{action:'QUICKSELL',price:qsPrice};if(mktPrice&&mktPrice>floor)return{action:'MARKETPLACE',price:Math.max(floor,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10),marketBest:mktPrice,depth,trend};return{action:'QUICKSELL',price:qsPrice}}
+function getSellDecision(defId,qty){
+  const floor=PRICE_FLOOR[defId]||0;
+  const qsPrice=QUICKSELL[defId]||0;
+  const mktPrice=marketPrices[defId];
+  const depth=getMarketDepth(defId);
+  const trend=getPriceTrend(defId);
+
+  // Valuable items (marketplace-only): always try marketplace, hold if no good price
+  if(MARKETPLACE_ONLY.has(defId)){
+    if(mktPrice&&mktPrice>=floor){
+      const undercut=Math.max(floor,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10);
+      return{action:'MARKETPLACE',price:undercut,marketBest:mktPrice,depth,trend};
+    }
+    // No market data or price too low — hold, don't dump
+    return{action:'HOLD',reason:`valuable (floor ${floor})`,floor};
+  }
+
+  // Cheap bulk mats — only these get quicksold (terminal NPC sell)
+  if(SAFE_QUICKSELL.has(defId)){
+    // But if market price is way higher than QS, list on marketplace instead
+    if(mktPrice&&mktPrice>0.5){
+      return{action:'MARKETPLACE',price:Math.max(floor||0.1,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10),marketBest:mktPrice,depth,trend};
+    }
+    return{action:'QUICKSELL',price:qsPrice};
+  }
+
+  // Unknown items: if we see a market price, list there; otherwise hold (never QS unknowns)
+  if(mktPrice&&mktPrice>0.1){
+    return{action:'MARKETPLACE',price:Math.max(0.1,Math.round(mktPrice*(1-UNDERCUT_PCT)*10)/10),marketBest:mktPrice,depth,trend};
+  }
+  if(floor>0)return{action:'HOLD',reason:'no market data, has value',floor};
+  return{action:'QUICKSELL',price:qsPrice||1};
+}
 
 // ============ PROFIT TRACKING ============
 function bucketEarn(a){if(!a||a<=0)return;const k=Math.floor(Date.now()/3600000);hourlyProfit[k]=(hourlyProfit[k]||0)+a;const keys=Object.keys(hourlyProfit).map(Number).sort((a,b)=>a-b);while(keys.length>48)delete hourlyProfit[keys.shift()]}
@@ -197,8 +229,25 @@ function decideNextAction(){
   if(hp<LOW_HP&&zone!=='clinic')return'heal';
   if(inventory.length>=CARRY_CAP-4)return'sell';
   if(stamina<LOW_STAMINA)return'eat';
+  // Quest-driven: if quest needs sell and we have sellable items, sell first
+  if(questState&&questState.activeId==='sell_your_first_haul'&&inventory.filter(i=>!KEEP.has(i.defId)&&i.qty>0).length>0)return'sell';
   const order=['sell','mining','fishing','combat','mining','fishing','mining','combat'];
   return order[stats.cycles%order.length];
+}
+
+// ============ QUEST AUTO-PROGRESS ============
+function tryProgressQuest(sock){
+  if(!questState||!questState.activeId)return;
+  const q=questState.activeId;
+  // "sell_your_first_haul" — walk to market, then sell triggers completion
+  if(q==='sell_your_first_haul'&&questState.step===0){
+    log('📜 Quest: walking to market to progress quest');
+    walkDirect(sock,ZONE_TARGETS.market,()=>{
+      sock.emit('quest:action',{type:'check'});
+    });
+  }
+  // Generic: always emit check after actions
+  sock.emit('quest:action',{type:'check'});
 }
 function getAliveMonster(){if(liveMonsters.length>0){const alive=liveMonsters.filter(m=>m.alive);if(alive.length>0)return alive[stats.currentMonsterIdx%alive.length]}return{id:'mon_1',pos:{x:-100,z:-120}}}
 
@@ -229,7 +278,7 @@ function walkDirect(sock,target,cb){if(!connected){cb();return}let step=0;const 
 
 // ============ SELL ============
 function doSellPhase(sock,cb){if(!inventory.length){cb();return}tryCraft(sock);log(`💰 SELL ${inventory.length} stacks`);const old=[...myActiveListings];function cancelNext(i){if(i>=old.length){freshSell(sock,cb);return}sock.emit('marketplace:cancel',{listingId:old[i].id});stats.canceled++;setTimeout(()=>cancelNext(i+1),1500)}if(old.length>0)cancelNext(0);else freshSell(sock,cb)}
-function freshSell(sock,cb){const toM=[],toQ=[],toH=[];for(const item of inventory){if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')continue;const d=getSellDecision(item.defId,item.qty);if(d.action==='HOLD'){toH.push(item);stats.holdCount++}else if(d.action==='MARKETPLACE')toM.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty,price:d.price,marketBest:d.marketBest});else toQ.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty})}log(`📊 MKT:${toM.length} QS:${toQ.length} HOLD:${toH.length}`);function listNext(i){if(i>=toM.length||!connected){if(toQ.length)quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000);return}const m=toM[i];sock.emit('marketplace:list',{instanceId:m.instanceId,qty:m.qty,price:m.price});log(`📋 ${m.defId} x${m.qty} @${m.price}`);setTimeout(()=>listNext(i+1),MARKET_INTERVAL)}if(toM.length>0)listNext(0);else if(toQ.length){quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000)}else cb()}
+function freshSell(sock,cb){const toM=[],toQ=[],toH=[];for(const item of inventory){if(KEEP.has(item.defId)||item.qty<1||item.status==='locked')continue;const d=getSellDecision(item.defId,item.qty);if(d.action==='HOLD'){toH.push({defId:item.defId,qty:item.qty,reason:d.reason});stats.holdCount++}else if(d.action==='MARKETPLACE')toM.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty,price:d.price,marketBest:d.marketBest});else toQ.push({instanceId:item.instanceId,defId:item.defId,qty:item.qty})}log(`📊 MKT:${toM.length} QS:${toQ.length} HOLD:${toH.length}`);for(const m of toM)log(`  📋 ${m.defId} x${m.qty} → MKT @${m.price} (best:${m.marketBest})`);for(const h of toH)log(`  🛡️ ${h.defId} x${h.qty} → HOLD (${h.reason})`);for(const q of toQ)log(`  💸 ${q.defId} x${q.qty} → QS`);function listNext(i){if(i>=toM.length||!connected){if(toQ.length)quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000);return}const m=toM[i];sock.emit('marketplace:list',{instanceId:m.instanceId,qty:m.qty,price:m.price});log(`📋 ${m.defId} x${m.qty} @${m.price}`);setTimeout(()=>listNext(i+1),MARKET_INTERVAL)}if(toM.length>0)listNext(0);else if(toQ.length){quickSellSafe(sock,toQ.filter(x=>SAFE_QUICKSELL.has(x.defId)));setTimeout(cb,3000)}else cb()}
 function quickSellSafe(sock,items){for(const it of items){if(!SAFE_QUICKSELL.has(it.defId)||!it.instanceId)continue;sock.emit('marketplace:quickSell',{instanceId:it.instanceId,qty:it.qty||1})}}
 
 // ============ ACTIONS ============
@@ -247,7 +296,19 @@ function runNextCycle(sock){
   log(`\n=== Cycle ${stats.cycles}: ${type.toUpperCase()} ===`);
   if(type==='heal'){walkDirect(sock,ZONE_TARGETS.clinic,()=>{tryClinicHeal(sock);setTimeout(()=>runNextCycle(sock),2000)});return}
   if(type==='eat'){tryEatFood(sock);setTimeout(()=>runNextCycle(sock),2000);return}
-  if(type==='sell'){sock.emit('economy:ledger');sock.emit('quest:action',{type:'check'});doSellPhase(sock,()=>setTimeout(()=>runNextCycle(sock),1500));return}
+  if(type==='sell'){
+    sock.emit('economy:ledger');
+    // Walk to market first (needed for quest progress + better for selling)
+    walkDirect(sock,ZONE_TARGETS.market,()=>{
+      sock.emit('quest:action',{type:'check'});
+      doSellPhase(sock,()=>{
+        // After selling, check quest progress
+        sock.emit('quest:action',{type:'check'});
+        setTimeout(()=>runNextCycle(sock),1500);
+      });
+    });
+    return;
+  }
   let wps;
   if(type==='mining')wps=[{x:0,z:0},MINING_NODES[stats.currentNodeIdx%MINING_NODES.length].pos];
   else if(type==='combat')wps=[{x:0,z:0},{x:-80,z:0},getAliveMonster().pos];
@@ -313,7 +374,22 @@ async function startBot(){
   socket.on('pvp:state',(d)=>{pvpState=d});
   socket.on('pvp:result',(d)=>{stats.pvpFights++;if(d.won){stats.pvpWins++;const r=d.reward||d.otwn||0;stats.pvpEarnings+=r;bucketEarn(r);log(`⚔️ PvP WIN +${r}`)}});
   socket.on('pvp:leaderboardData',(d)=>{if(d.entries)log(`⚔️ PvP board: ${d.entries.length} entries, #1: ${d.entries[0]?.name||'?'}`)});
-  socket.on('quest:state',(d)=>{const prev=questState;questState=d;if(!prev||prev.activeId!==d.activeId||prev.step!==d.step||prev.progress!==d.progress||(prev.completed||[]).length!==(d.completed||[]).length)log(`📜 Quest: ${d.activeId||'none'} step:${d.step||0} done:${(d.completed||[]).length}`)});
+  socket.on('quest:state',(d)=>{
+    const prev=questState;questState=d;
+    const changed=!prev||prev.activeId!==d.activeId||prev.step!==d.step||prev.progress!==d.progress||(prev.completed||[]).length!==(d.completed||[]).length;
+    if(changed){
+      log(`📜 Quest: ${d.activeId||'none'} step:${d.step||0} progress:${d.progress||0} done:${(d.completed||[]).length}`);
+      // Quest completed notification
+      if(prev&&prev.activeId&&!d.activeId){
+        stats.questsCompleted++;
+        notify(`🏆 <b>Quest selesai!</b> ${prev.activeId}\nTotal: ${(d.completed||[]).length} quests`);
+      }
+      // New quest available — auto-start
+      if(prev&&prev.activeId&&d.activeId&&prev.activeId!==d.activeId){
+        notify(`📜 <b>Quest baru:</b> ${d.activeId}`);
+      }
+    }
+  });
   socket.on('quest:toast',(d)=>{notifySys(`📜 <b>${d.title}</b>\n${d.message}`)});
   socket.on('candy:error',(d)=>{log(`🍬 ${d.code}: ${d.message||''}`)});
   socket.on('casino:error',(d)=>{log(`🎰 ${d.code}: ${d.message||''}`)});
