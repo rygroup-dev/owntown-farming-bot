@@ -420,12 +420,12 @@ async function startBot(){
 
   socket.on('connect',()=>{
     connected=true;touchActivity();if(retryTimer){clearTimeout(retryTimer);retryTimer=null}
-    log('Connected!');notifySys(`🟢 <b>Connected</b> — ${GAME_HOST}`);activeSocket=socket;
+    log('Connected!');notify(`🟢 <b>Connected</b> — ${GAME_HOST}`);activeSocket=socket;
     let started=false;
     socket.on('player:correction',function onC(d){if(!started&&d.pos){pos.x=d.pos.x;pos.z=d.pos.z;started=true;socket.removeListener('player:correction',onC);log(`Pos:(${pos.x.toFixed(1)},${pos.z.toFixed(1)}) ${zoneName}`);waitInv(socket,()=>{socket.emit('economy:ledger');checkBank(token);socket.emit('property:info',{});socket.emit('candy:claim');runNextCycle(socket)})}});
     setTimeout(()=>{if(!started){started=true;waitInv(socket,()=>runNextCycle(socket))}},3000);
   });
-  socket.on('disconnect',(r)=>{log('Disconnected: '+r);connected=false;if(stopped)return;reportError({code:r,context:'disconnect',category:'reconnect'});notifySys(`🔴 Disconnected — reconn ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);scheduleStart(RECONNECT_BACKOFF_MS)});
+  socket.on('disconnect',(r)=>{log('Disconnected: '+r);connected=false;if(stopped)return;reportError({code:r,context:'disconnect',category:'reconnect'});notify(`🔴 Disconnected — reconn ${Math.round(RECONNECT_BACKOFF_MS/1000)}s`);scheduleStart(RECONNECT_BACKOFF_MS)});
   socket.on('connect_error',(err)=>{const msg=(err&&err.message)||'connect_error';log('⚠️ '+msg);if(stopped)return;reportError({code:msg,context:'connect_error',category:'reconnect'});if(/auth|token|unauthorized|forbidden|403|401/i.test(msg))token=null;try{socket.disconnect()}catch{}scheduleStart(5000)});
   function waitInv(s,cb){if(inventoryReady){cb();return}let w=0;const iv=setInterval(()=>{w+=500;if(inventoryReady||w>5000){clearInterval(iv);cb()}},500)}
 }
@@ -679,7 +679,7 @@ let schedulePhases=[],schedIdx=0,schedPhaseEnd=0;
 const scheduleActive=config.scheduleEnabled;
 function jitterMs(h){return Math.round(h*3600000*(1+(Math.random()*2-1)*config.scheduleJitterPct/100))}
 function schedUntilStr(){return new Date(schedPhaseEnd).toISOString().slice(11,16)}
-function applyPhase(ann){const p=schedulePhases[schedIdx];if(!p)return;schedPhaseEnd=Date.now()+jitterMs(p.hours);if(p.state==='on'){if(stopped){stopped=false;startBot()}}else{stopped=true;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false}if(ann)notifySys(`🗓️ <b>${p.state.toUpperCase()}</b> ~${p.hours}h`)}
+function applyPhase(ann){const p=schedulePhases[schedIdx];if(!p)return;schedPhaseEnd=Date.now()+jitterMs(p.hours);if(p.state==='on'){if(stopped){stopped=false;startBot()}}else{stopped=true;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false}if(ann)notify(`🗓️ <b>${p.state.toUpperCase()}</b> ~${p.hours}h`)}
 function schedStatus(){if(!scheduleActive||!schedulePhases.length)return'off';const p=schedulePhases[schedIdx],m=Math.max(0,Math.round((schedPhaseEnd-Date.now())/60000));return`${p.state.toUpperCase()} ~${Math.floor(m/60)}h${m%60}m`}
 if(scheduleActive){schedulePhases=parseSchedule(config.scheduleRaw);if(schedulePhases.length)applyPhase(false)}
 setInterval(()=>{if(!scheduleActive||!schedulePhases.length)return;if(Date.now()>=schedPhaseEnd){schedIdx=(schedIdx+1)%schedulePhases.length;applyPhase(true)}},30000);
