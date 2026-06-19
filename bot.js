@@ -230,9 +230,12 @@ function decideNextAction(){
   if(inventory.length>=CARRY_CAP-4)return'sell';
   if(stamina<LOW_STAMINA)return'eat';
   // Quest-driven: if quest needs sell and we have actually sellable items
-  if(questState&&questState.activeId==='sell_your_first_haul'&&inventory.some(i=>!KEEP.has(i.defId)&&i.qty>0&&!MARKETPLACE_ONLY.has(i.defId)&&SAFE_QUICKSELL.has(i.defId)))return'sell';
+  if(questState&&questState.activeId==='sell_your_first_haul'&&inventory.some(isSellable))return'sell';
   const order=['sell','mining','fishing','combat','mining','fishing','mining','combat'];
-  return order[stats.cycles%order.length];
+  let action=order[stats.cycles%order.length];
+  // Skip sell rotation when nothing to sell — advance to next activity
+  if(action==='sell'&&!inventory.some(isSellable))action=order[(stats.cycles+1)%order.length];
+  return action;
 }
 
 // ============ QUEST AUTO-PROGRESS ============
@@ -409,6 +412,24 @@ async function startBot(){
   socket.on('property:infoResult',(d)=>{log(`🏠 ${d.properties?.length||0} properties`)});
   socket.on('property:result',(d)=>{if(d.ok&&d.earnings){stats.propertyEarnings+=d.earnings;bucketEarn(d.earnings)}});
   socket.on('shop:result',(d)=>{if(d.ok)log(`🛒 ${d.item||d.action||'ok'}`)});
+  socket.on('bank:result',(d)=>{
+    if(d.ok){
+      log(`🏦 Bank ${d.action||'ok'}: ${d.amount||''} OTWN`);
+      notify(`🏦 <b>Bank ${d.action||'OK'}</b>\n${d.amount?fmt(d.amount)+' OTWN':''}${d.balance?'\nBank balance: '+fmt(d.balance):''}`);
+      checkBank(token);
+    } else {
+      log(`🏦 Bank fail: ${d.code||d.message||JSON.stringify(d)}`);
+      notify(`🏦 <b>Bank error</b>: ${d.message||d.code||'failed'}`);
+    }
+  });
+  socket.on('bank:deposit:result',(d)=>{
+    if(d.ok||d.credited){notify(`🏦 <b>Deposit OK</b> ${d.credited?fmt(d.credited)+' OTWN':''}`);checkBank(token)}
+    else notify(`🏦 <b>Deposit failed</b>: ${d.message||d.code||'error'}`);
+  });
+  socket.on('bank:withdraw:result',(d)=>{
+    if(d.ok||d.withdrawn){notify(`🏦 <b>Withdraw OK</b> ${d.withdrawn?fmt(d.withdrawn)+' OTWN':''}`);checkBank(token)}
+    else notify(`🏦 <b>Withdraw failed</b>: ${d.message||d.code||'error'}`);
+  });
   socket.on('economy:ledger',(d)=>{if(d.entries)economyLedger=d.entries});
   socket.on('marketplace:result',(d)=>{if(d.ok&&d.credited)recordSale(d.defId||'qs',d.count||d.qty||1,'quickSell',d.credited)});
   socket.on('marketplace:quickSell:result',(d)=>{if(d.credited)recordSale(d.defId||'qs',d.count||d.qty||1,'quickSell',d.credited)});
@@ -450,7 +471,41 @@ const WD_MS=Math.max(2,config.watchdogStuckMin)*60000;
 setInterval(()=>{if(paused||stopped)return;const idle=Date.now()-lastActivity;if(connected&&idle>WD_MS){log('🐶 WATCHDOG');touchActivity();if(activeSocket&&activeSocket.connected)try{runNextCycle(activeSocket)}catch{}else scheduleStart(2000)}if(!connected&&idle>WD_MS*2){touchActivity();scheduleStart(2000)}},60000);
 
 // ============ TELEGRAM COMMANDS ============
-tg.on('help',()=>notify(['🏭 <b>OWNTOWN v25 — Smart Orchestrator</b>','','📊 /status /balance /daily /income /wallet','🎮 /inventory /market /trades /listings','📜 /quest /candy /boss /world /pvpboard','⚙️ /start /stop /pause /resume /reauth /restart /update','🔧 /health /errors /settings /schedule /log /ping','','<i>⚠️ 1 wallet = 1 sesi</i>'].join('\n')));
+tg.on('help',()=>notify([
+  '🏭 <b>OWNTOWN v25 — Smart Orchestrator</b>',
+  '',
+  '📊 <b>Dashboard</b>',
+  '/status — dashboard lengkap',
+  '/balance — saldo OTWN+Candy+Chip',
+  '/daily — laporan harian',
+  '/income — pendapatan + grafik',
+  '',
+  '💰 <b>Wallet & Bank</b>',
+  '/wallet — info wallet + on-chain',
+  '/wallet deposit [jumlah] — setor ke bank',
+  '/wallet withdraw [jumlah] — tarik dari bank',
+  '',
+  '🎮 <b>Game</b>',
+  '/inventory — isi tas + nilai',
+  '/market — harga pasar + tren',
+  '/trades — riwayat jual',
+  '/listings — listing aktif',
+  '/quest — status quest',
+  '/candy — candy + ekonomi',
+  '/boss — world boss',
+  '/world — live state + mobs',
+  '/pvpboard — PvP leaderboard',
+  '',
+  '⚙️ <b>Control</b>',
+  '/start · /stop · /pause · /resume',
+  '/reauth · /restart · /update',
+  '',
+  '🔧 <b>System</b>',
+  '/health · /errors · /settings',
+  '/schedule · /log [n] · /ping',
+  '',
+  '<i>⚠️ 1 wallet = 1 sesi. /stop untuk main manual.</i>',
+].join('\n')));
 tg.on('start',()=>{paused=false;stopped=false;if(connected){notify('▶️ Already farming.');return}notify('🚀 Connecting…');startBot()});
 tg.on('stop',()=>{stopped=true;paused=false;if(retryTimer){clearTimeout(retryTimer);retryTimer=null}try{if(activeSocket)activeSocket.disconnect()}catch{}connected=false;notify('⏹️ <b>Stopped</b> — main manual.')});
 tg.on('status',()=>{const p=getProfitSummary(),up=fmtUptime(Date.now()-stats.startTime),alive=liveMonsters.filter(m=>m.alive).length;notify([`${connected?'🟢':'🔴'} <b>OWNTOWN v25</b> · ${paused?'⏸️':stopped?'⏹️':connected?'▶️ '+currentActivity:'⏳'}`,`<i>⏱${up} · 📍${zoneName} · Lv${level} (${stats.xp}/${stats.xpForNext||'?'}XP)</i>`,'','💰 <b>Economy</b>',`<pre>Balance  ${fmt(Math.round(balance))} OTWN\nCandy    ${fmt(candyBalance)}\nChip     ${fmt(chipBalance)}\nBank     ${fmt(stats.bankBalance)}\nEarned   ${fmt(p.totalEarned)} · ${fmt(p.rate)}/h</pre>`,'',`🧍 ❤️${hp}/${maxHp} ⚡${stamina} 📦${inventory.length}/${CARRY_CAP}`,`⛏${fmt(stats.mined)} 🎣${fmt(stats.fished)} ⚔${fmt(stats.kills)} 🔨${fmt(stats.crafted)} 👹${fmt(stats.bossClaims)}`,`🌍 ${serverPlayerCount} online · ${alive}/${liveMonsters.length} mobs · boss:${worldBossState?.phase||'?'}`,`📜 Quest: ${questState?.activeId||'none'} (${(questState?.completed||[]).length} done)`,`${stats.errors?'⚠️':'✅'} err:${stats.errors} reconn:${stats.reconnects||0}`].join('\n'))});
@@ -458,7 +513,45 @@ tg.on('stats',()=>tg.handlers['status']());
 tg.on('balance',()=>notify(`💰 <b>Balance</b>\n<pre>OTWN     ${fmt(Math.round(balance))}\nLocked   ${fmt(lockedBalance)}\nCandy    ${fmt(candyBalance)} 🍬\nChip     ${fmt(chipBalance)} 🎰\nBank     ${fmt(stats.bankBalance)}\nDaily    ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}</pre>`));
 tg.on('daily',()=>notify(buildDaily()));
 tg.on('income',()=>{const p=getProfitSummary();const hrs=getHourly(12).map(h=>`${h.h}:00 ${'█'.repeat(Math.min(10,Math.ceil(h.v/Math.max(1,...getHourly(12).map(x=>x.v))*10)))} +${fmt(h.v)}`).join('\n');notify(`💵 <b>Income</b>\n<pre>Total  ${fmt(p.totalEarned)}\nRate   ${fmt(p.rate)}/h\nQS     +${fmt(stats.earnedQuick)}\nMKT    +${fmt(stats.earnedMarket)}\nPvP    +${fmt(stats.pvpEarnings)}\nSold   ${fmt(p.itemsSold)}</pre>\n<pre>${hrs}</pre>`)});
-tg.on('wallet',()=>notify(`🔑 <b>Wallet</b>\n<code>${WALLET_ADDR||'auto'}</code>\n💰${fmt(Math.round(balance))} 🍬${fmt(candyBalance)} 🎰${fmt(chipBalance)}`));
+tg.on('wallet',async(args)=>{
+  // /wallet deposit <amount> or /wallet withdraw <amount>
+  const sub=(args[0]||'').toLowerCase();
+  const amount=parseFloat(args[1])||0;
+  if(sub==='deposit'&&amount>0){
+    if(amount<100){notify('⚠️ Minimum deposit: 100 OTWN');return}
+    if(balance<amount){notify(`⚠️ Balance ${fmt(Math.round(balance))} < ${amount}`);return}
+    if(activeSocket)activeSocket.emit('bank:deposit',{amount});
+    notify(`🏦 <b>Depositing</b> ${fmt(amount)} OTWN ke bank…`);
+    return;
+  }
+  if(sub==='withdraw'&&amount>0){
+    const minW=bankInfo?.withdrawMin||5000;
+    if(amount<minW){notify(`⚠️ Minimum withdraw: ${fmt(minW)} OTWN`);return}
+    if(!bankInfo||bankInfo.withdrawable<amount){notify(`⚠️ Bank withdrawable: ${fmt(bankInfo?.withdrawable||0)} < ${amount}`);return}
+    if(activeSocket)activeSocket.emit('bank:withdraw',{amount});
+    notify(`🏦 <b>Withdrawing</b> ${fmt(amount)} OTWN dari bank…`);
+    return;
+  }
+  // Show wallet info
+  try{await checkBank(token)}catch{}
+  const bi=bankInfo||{};
+  notify([
+    '🔑 <b>Wallet</b>',
+    `<code>${WALLET_ADDR||'auto-derive'}</code>`,
+    '',
+    '<pre>' +
+    `💰 Balance     ${fmt(Math.round(balance))} OTWN\n` +
+    `🔒 Locked      ${fmt(lockedBalance)}\n` +
+    `🍬 Candy       ${fmt(candyBalance)}\n` +
+    `🎰 Chip        ${fmt(chipBalance)}\n` +
+    `🏦 Bank        ${fmt(bi.withdrawable||0)} withdrawable\n` +
+    `⛓️ On-chain    ${fmt(bi.onChainBalance||0)} OTWN\n` +
+    `📅 Daily       ${fmt(dailyEarned)} / ${DAILY_EARN_CAP||'∞'}` +
+    '</pre>',
+    '',
+    '<i>💡 /wallet deposit [amount]\n💡 /wallet withdraw [amount]</i>',
+  ].join('\n'));
+});
 tg.on('quest',()=>{if(!questState){notify('📜 No quest data.');return}notify(`📜 <b>Quest</b>\nActive: <b>${questState.activeId||'none'}</b>\nStep: ${questState.step||0} Progress: ${questState.progress||0}\nDone: ${(questState.completed||[]).join(', ')||'none'}`)});
 tg.on('candy',async()=>{try{const h=await apiGet('/api/health');const e=h.data?.economy||{};notify(`🍬 <b>Candy</b>\nBalance: <b>${fmt(candyBalance)}</b>\n<pre>Price    $${e.candyUsd||'?'}\n1 CANDY  ${e.lastCandyOtwn||'?'} OTWN\nStaked   ${fmt(e.candyStaked)} OTWN\nPool     ${fmt(e.candyDailyPool)}/day\nMinted   ${fmt(e.candyMinted)}\nBurned   ${fmt(e.candyBurned)}\nVol 24h  ${fmt(e.candyVolume24h)}</pre>`)}catch(er){notify(`🍬 ${fmt(candyBalance)} (err: ${er.message})`)}});
 tg.on('boss',()=>{if(!worldBossState){notify('👹 No data.');return}const next=worldBossState.nextSpawnAt?new Date(worldBossState.nextSpawnAt).toISOString().slice(11,16):'?';notify(`👹 <b>World Boss</b>\nPhase: <b>${worldBossState.phase}</b>\nHP: ${worldBossState.hp||0}/${worldBossState.maxHp||500000}\nNext: ${next} UTC\nMin Lv: ${worldBossState.minLevel||10}\nClaims: ${stats.bossClaims}`)});
