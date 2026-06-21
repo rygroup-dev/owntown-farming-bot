@@ -2,6 +2,8 @@
 
 Automated `owntown.fun` farming bot with Telegram control and monitoring.
 
+> **v33.0.0** — Tool-break resilience (auto-switches to fishing/combat + auto-repairs the pick instead of silently dying), zone coordinates re-verified against the live client, Candy Factory awareness (`candy:stake`/`candy:claim`), and connection-watchdog hardening. A fresh user only needs a Solana wallet key + a Telegram bot token (see install below).
+
 ## Features
 
 - Solana wallet authentication via challenge-response
