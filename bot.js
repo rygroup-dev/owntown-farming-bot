@@ -64,7 +64,7 @@ let lastActivity = Date.now();
 let activeSocket = null;
 let lastCycleStart = Date.now();
 let retryTimer = null;
-let maintenanceInFlight = false;
+let maintenanceInFlight = false, maintenanceSince = 0;
 let nextRetryAt = 0;
 let lastDisconnectAt = 0;
 let lastDisconnectReason = 'none';
@@ -106,7 +106,7 @@ const MAX_WALK_STEPS = 5000;
 let DAILY_EARN_CAP = 0;
 let CARRY_CAP = 44;
 const MARKET_INTERVAL = 3500;
-const LOW_DURABILITY = 30;
+const LOW_DURABILITY = 50; // repair earlier so the pick never breaks mid-mining
 const MINING_RANGE = 6; // emit mining:start only within this many units of node
 const COMBAT_RANGE = 8; // emit combat:attack only within this many units of mob
 const FISHING_TIMEOUT = 120000;
@@ -198,6 +198,8 @@ let pos={x:0,z:0},zone='unknown',zoneName='unknown',mapId='main',fishingActive=f
 let myActiveListings=[],marketPrices={},marketHistory=[],fatigueMultiplier=1.0;
 let worldBossState=null,bankInfo=null,pvpState=null,economyLedger=[];
 let chipBalance=0,candyBalance=0,questState=null,playerStats={},equipmentBonuses={},equipment={};
+let toolBroken=false,toolBrokenSince=0; // mining pick durability hit 0 → skip mining until repaired
+let zoneFailUntil={}; // activity → ts; set when its zone is unreachable (stale coords after a map update)
 let tradeLog=[],pendingSales=[],lastCreditAt=0,hourlyProfit={};
 
 // ============ REST API ============
@@ -255,18 +257,22 @@ function decideNextAction(){
   // Quest-driven: prioritise the activity the active quest needs
   const qn=questNeedsAction();
   if(qn==='sell'&&inventory.some(i=>!KEEP.has(i.defId)&&i.qty>0&&i.status!=='locked'))return'sell';
-  if(qn==='mining')return'mining';
+  if(qn==='mining'&&!toolBroken)return'mining';
   if(qn==='fishing')return'fishing';
   if(qn==='combat')return'combat';
   // Weighted-random rotation (non-deterministic to avoid a periodic signature),
   // with adaptive weights that favour the activity whose items are priced highest.
+  const now=Date.now();
+  const zoneOk=(a)=>!(zoneFailUntil[a]>now); // skip activities whose zone is on cooldown
   const eligible=[];
   if(inventory.some(isSellable))eligible.push('sell');
-  eligible.push('mining','fishing');
-  if(liveMonsters.some(m=>m.alive))eligible.push('combat');
+  if(!toolBroken&&zoneOk('mining'))eligible.push('mining'); // skip mining while pick broken / zone unreachable
+  if(zoneOk('fishing'))eligible.push('fishing');
+  if(liveMonsters.some(m=>m.alive)&&zoneOk('combat'))eligible.push('combat');
+  if(!eligible.some(a=>a!=='sell'))eligible.push('fishing'); // never leave it with nothing to do
   const adaptive=activityWeights({ marketPrices, base:{ mining:3, fishing:2 }, miningItems:MINING_ITEMS, fishingItems:FISHING_ITEMS, highPrice:10 });
-  const weights={ sell:2, mining:adaptive.mining, fishing:adaptive.fishing, combat:2 };
-  return pickActivity({ eligible, weights }) || 'mining';
+  const weights={ sell:2, mining:toolBroken?0:adaptive.mining, fishing:adaptive.fishing, combat:2 };
+  return pickActivity({ eligible, weights }) || 'fishing';
 }
 
 // ============ QUEST AUTO-PROGRESS ============
@@ -403,7 +409,7 @@ function runNextCycle(sock){
   walkStaged(sock,wps,0,()=>{
     if(!connected)return;
     const exp=EXPECTED_ZONE[type];
-    if(exp&&zone!==exp&&zone!=='unknown'){stats.wrongZone++;reportError({code:'WRONG_ZONE',context:`need ${exp}, at ${zone}`});const t=ZONE_TARGETS[exp];if(t){walkDirect(sock,t,()=>{if(zone!==exp){setTimeout(()=>runNextCycle(sock),2000);return}doActions(sock,type)});return}}
+    if(exp&&zone!==exp&&zone!=='unknown'){stats.wrongZone++;reportError({code:'WRONG_ZONE',context:`need ${exp}, at ${zone}`});const t=ZONE_TARGETS[exp];if(t){walkDirect(sock,t,()=>{if(zone!==exp){zoneFailUntil[type]=Date.now()+300000;log(`🚧 ${type} zone '${exp}' unreachable (at ${zone}) — cooldown 5m, trying another activity`);setTimeout(()=>runNextCycle(sock),2000);return}doActions(sock,type)});return}}
     if(type==='pvp'){pvpQueue(sock);doActions(sock,type)}else doActions(sock,type);
   });
 }
@@ -448,10 +454,18 @@ async function startBot(){
     if(d.dailyEarnCap!==undefined&&d.dailyEarnCap>0)DAILY_EARN_CAP=d.dailyEarnCap;
     const pid=d.playerId||d.id;if(pid&&!MY_PLAYER_ID){MY_PLAYER_ID=String(pid);log(`🆔 Player: ${MY_PLAYER_ID}`)}
   });
-  socket.on('inventory:update',(d)=>{inventory=(d.items||[]).filter(i=>i.qty>0);if(!inventoryReady){inventoryReady=true;log(`📦 ${inventory.length} stacks`)}const tool=d.items.find(i=>i.defId==='tool_pulse_pick');if(tool&&tool.durability!==null&&tool.durability<LOW_DURABILITY&&tool.instanceId){socket.emit('inventory:repair',{instanceId:tool.instanceId});stats.repaired++}if(pendingEquip){const item=inventory.find(i=>i.defId===pendingEquip);if(item){socket.emit('equipment:set',{instanceId:item.instanceId,slot:'weapon'});pendingEquip=null}}});
+  socket.on('inventory:update',(d)=>{inventory=(d.items||[]).filter(i=>i.qty>0);if(!inventoryReady){inventoryReady=true;log(`📦 ${inventory.length} stacks`)}const tool=d.items.find(i=>i.defId==='tool_pulse_pick');if(tool&&tool.durability!==null&&tool.instanceId){if(tool.durability<LOW_DURABILITY){socket.emit('inventory:repair',{instanceId:tool.instanceId});stats.repaired++;if(!inventory.find(i=>i.defId==='kit_repair'&&i.qty>0))tryCraft(activeSocket||socket)}if(toolBroken&&tool.durability>LOW_DURABILITY){toolBroken=false;log('✅ Pick healthy — resuming mining')}}if(pendingEquip){const item=inventory.find(i=>i.defId===pendingEquip);if(item){socket.emit('equipment:set',{instanceId:item.instanceId,slot:'weapon'});pendingEquip=null}}});
   socket.on('marketplace:update',(d)=>{if(d.listings){myActiveListings=d.listings.filter(l=>l.sellerPlayerId===MY_PLAYER_ID&&l.status==='active');scanMarketPrices(d.listings);if(!checkFlipOpportunities(socket,d.listings))checkPowerupBuys(socket,d.listings)}});
   socket.on('mining:result',(d)=>{touchActivity();stats.mined++;stats.xp+=d.xpGained||0;stats.items+=d.qty||0;stats.consecutiveErrors=0;if(d.fatigueMultiplier!==undefined)fatigueMultiplier=d.fatigueMultiplier;log(`⛏ ${d.itemName} x${d.qty} +${d.xpGained}XP`)});
-  socket.on('mining:error',(d)=>{reportError({code:d.code,context:'mining'})});
+  socket.on('mining:error',(d)=>{
+    reportError({code:d.code,context:'mining'});
+    if(/TOOL_BROKEN|BROKEN|DURABILITY/i.test(String(d.code||''))){
+      if(!toolBroken){toolBroken=true;toolBrokenSince=Date.now();log('🛠️ Pick broken — switching off mining, attempting repair');notify('🛠️ <b>Pick broken</b> — repairing & switching to fishing/combat');}
+      const tool=inventory.find(i=>i.defId==='tool_pulse_pick');
+      if(tool&&tool.instanceId)socket.emit('inventory:repair',{instanceId:tool.instanceId});
+      if(!inventory.find(i=>i.defId==='kit_repair'&&i.qty>0))tryCraft(socket); // craft a repair kit if we have none
+    }
+  });
   socket.on('fishing:cast',()=>{fishingActive=true});
   socket.on('fishing:result',(d)=>{touchActivity();fishingActive=false;stats.fished++;stats.xp+=d.xp||d.xpGained||0;stats.consecutiveErrors=0;log(`🎣 ${d.itemName||'fish'} x${d.qty||1} +${d.xp||0}XP`)});
   socket.on('fishing:error',(d)=>{fishingActive=false;reportError({code:d.code,context:'fishing'})});
@@ -515,7 +529,7 @@ async function startBot(){
   ['marketplace:list:result','marketplace:listed'].forEach(e=>socket.on(e,()=>{stats.listed++}));
   socket.on('toast',(d)=>{if(d.kind==='success'){const msg=(d.message||'').toLowerCase();if((msg.includes('sold')||msg.includes('received'))&&Date.now()-lastCreditAt>3500){const m=d.message.match(/(\d[\d,.]*)\s*\$?OTWN/);if(m){const a=parseFloat(m[1].replace(/,/g,''));if(a>0)recordSale('market-sale',1,'marketplace',a)}}}});
   socket.on('inventory:craft',(d)=>{log(`🔨 Crafted`)});
-  socket.on('inventory:repair',()=>{log('🔧 Repaired')});
+  socket.on('inventory:repair',()=>{log('🔧 Repaired');if(toolBroken){toolBroken=false;log('✅ Pick repaired — resuming mining');notify('✅ <b>Pick repaired</b> — mining resumed')}});
   socket.on('notifications',(d)=>{if(d.items)stats.notifications=d.items.length});
 
   socket.on('connect',()=>{
@@ -556,7 +570,7 @@ setInterval(()=>{
   if(!shouldBeOnline())return;
   if(connected)return;
   if(retryTimer)return;            // a retry is already armed
-  if(maintenanceInFlight)return;   // restart/update in progress
+  if(maintenanceInFlight){ if(maintenanceSince&&Date.now()-maintenanceSince>300000){log('🛟 supervisor: maintenance stuck >5m — clearing');maintenanceInFlight=false;}else return; }
   log('🛟 supervisor: no connection and no pending retry — re-arming');
   scheduleStart(2000);
 },60000);
@@ -787,8 +801,8 @@ async function inspectUpdateState(){
   if(localSha!==baseSha)return{ok:false,reason:`local branch ${branchName} is ahead of origin; push or reconcile first`};
   return{ok:true,status:'behind',branch:branchName,localSha,remoteSha};
 }
-tg.on('restart',()=>{if(maintenanceInFlight){notify('🛠️ Maintenance already running.');return}maintenanceInFlight=true;notify('♻️ Restarting…');setTimeout(()=>process.exit(0),800)});
-tg.on('update',async()=>{if(maintenanceInFlight){notify('🛠️ Maintenance already running.');return}maintenanceInFlight=true;try{notify('🔎 Checking repo…');const state=await inspectUpdateState();if(!state.ok){notify(`⚠️ Update blocked: ${esc(state.reason)}`);maintenanceInFlight=false;return}if(state.status==='up_to_date'){notify('✅ Already latest on origin.');maintenanceInFlight=false;return}notify(`⬇️ Pulling origin/${state.branch}…`);const pull=await runExec('git',['pull','--ff-only','origin',state.branch]);const summary=esc((pull.stdout||pull.stderr||'no output').slice(0,600));notify('<pre>'+summary+'</pre>');if(pull.error){notify(`⚠️ Update failed: ${esc(pull.error.message)}`);maintenanceInFlight=false;return}notify('♻️ Restarting…');setTimeout(()=>process.exit(0),1000)}catch(err){notify(`⚠️ Update failed: ${esc(err.message||String(err))}`);maintenanceInFlight=false}});
+tg.on('restart',()=>{if(maintenanceInFlight){notify('🛠️ Maintenance already running.');return}maintenanceInFlight=true;maintenanceSince=Date.now();notify('♻️ Restarting…');setTimeout(()=>process.exit(0),800)});
+tg.on('update',async()=>{if(maintenanceInFlight){notify('🛠️ Maintenance already running.');return}maintenanceInFlight=true;maintenanceSince=Date.now();try{notify('🔎 Checking repo…');const state=await inspectUpdateState();if(!state.ok){notify(`⚠️ Update blocked: ${esc(state.reason)}`);maintenanceInFlight=false;return}if(state.status==='up_to_date'){notify('✅ Already latest on origin.');maintenanceInFlight=false;return}notify(`⬇️ Pulling origin/${state.branch}…`);const pull=await runExec('git',['pull','--ff-only','origin',state.branch]);const summary=esc((pull.stdout||pull.stderr||'no output').slice(0,600));notify('<pre>'+summary+'</pre>');if(pull.error){notify(`⚠️ Update failed: ${esc(pull.error.message)}`);maintenanceInFlight=false;return}notify('♻️ Restarting…');setTimeout(()=>process.exit(0),1000)}catch(err){notify(`⚠️ Update failed: ${esc(err.message||String(err))}`);maintenanceInFlight=false}});
 
 // ============ CRASH ============
 process.on('uncaughtException',(err)=>{log('💥 '+((err&&err.stack)||err));notify(`💥 <b>Crash</b>: ${err&&err.message||err}`);setTimeout(()=>process.exit(1),1200)});
