@@ -165,11 +165,13 @@ const MINING_NODES = [
 const MINING_ITEMS = ['mat_raw_resonite','mat_circuit_scrap','mat_iron_shard','mat_carbon_fiber','mat_resonance_core'];
 const FISHING_ITEMS = ['fish_sun_carp','fish_moon_koi','fish_void_angler','fish_abyssal_lantern','fish_golden_koi','fish_silver_darter'];
 
+// Coordinates verified against the live owntown client POI markers (2026-06-21).
 const ZONE_TARGETS = {
-  deepworks:{x:75,z:-95}, pond:{x:-148.5,z:0}, redline_a:{x:-100,z:-120},
-  residential:{x:-75,z:0}, spawn_plaza:{x:0,z:0}, clinic:{x:-60,z:-30},
-  food_row:{x:20,z:55}, market:{x:25,z:-15}, garage:{x:45,z:-30},
-  arena:{x:194,z:-185}, civic_green:{x:10,z:20}, skyvault:{x:50,z:60},
+  deepworks:{x:112,z:-130}, pond:{x:-155,z:0}, redline_a:{x:-86,z:-100},
+  residential:{x:-82,z:78}, spawn_plaza:{x:0,z:0}, clinic:{x:10.5,z:-59},
+  food_row:{x:22,z:52}, market:{x:90,z:0}, garage:{x:84,z:-53},
+  arena:{x:194,z:-185}, civic_green:{x:-15,z:77}, skyvault:{x:-95,z:92},
+  candyfactory:{x:-148,z:-49},
 };
 const WAYPOINTS_BASE = { fishing:[{x:0,z:0},{x:-80,z:0},{x:-148.5,z:0}] };
 const EXPECTED_ZONE = { mining:'deepworks', fishing:'pond', combat:'redline_a', pvp:'arena' };
